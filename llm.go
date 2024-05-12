@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"log"
 
 	"bytes"
 	"encoding/json"
@@ -10,6 +11,10 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/textarea"
+	"github.com/charmbracelet/bubbles/viewport"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
 
@@ -232,6 +237,7 @@ func main() {
 	var is_terminal bool = is_interactive(os.Stdout.Fd())
 
 	rootCmd.Flags().StringP("model", "m", "gpt-3.5-turbo", "LLM model")
+	rootCmd.Flags().BoolP("chat", "c", false, "Launch chat mode")
 	rootCmd.Flags().StringP("prompt", "p", "", "System prompt")
 	rootCmd.Flags().IntP("seed", "s", 1337, "Random seed")
 	rootCmd.Flags().Float64P("temperature", "t", 0.0, "Temperature")
@@ -247,13 +253,14 @@ func main() {
 }
 
 func runLLMChat(cmd *cobra.Command, args []string) error {
-	model, _ := cmd.Flags().GetString("model")
+	modelname, _ := cmd.Flags().GetString("model")
 	seed, _ := cmd.Flags().GetInt("seed")
 	temperature, _ := cmd.Flags().GetFloat64("temperature")
 	apiKey, _ := cmd.Flags().GetString("api-key")
 	apiBase, _ := cmd.Flags().GetString("api-base")
 	stream, _ := cmd.Flags().GetBool("stream")
 	verbose, _ := cmd.Flags().GetBool("v")
+	chat, _ := cmd.Flags().GetBool("c")
 	systemPrompt, _ := cmd.Flags().GetString("prompt")
 
 	messages := make([]Message, 0)
@@ -286,12 +293,31 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	messages = append(messages, Message{
-		Role:    "user",
-		Content: usermsg,
-	})
+	if len(usermsg) > 0 {
+		messages = append(messages, Message{
+			Role:    "user",
+			Content: usermsg,
+		})
+	}
 
-	ch, err := llmChat(messages, model, seed, temperature, nil, apiKey, apiBase, stream, nil, verbose)
+	llmApiFunc := func(messages []Message) (<-chan string, error) {
+		return llmChat(messages, modelname, seed, temperature, nil, apiKey, apiBase, true, nil, verbose)
+	}
+
+	if len(usermsg) == 0 || chat {
+		p := tea.NewProgram(initialModel(messages, llmApiFunc))
+
+		if _, err := p.Run(); err != nil {
+			log.Println(err)
+			return err
+		}
+
+		// TODO: save history
+
+		return nil
+	}
+
+	ch, err := llmChat(messages, modelname, seed, temperature, nil, apiKey, apiBase, stream, nil, verbose)
 
 	if err != nil {
 		fmt.Println(err)
@@ -340,4 +366,155 @@ func (t *loggingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	}
 
 	return resp, nil
+}
+
+type chatTuiState struct {
+	viewport    viewport.Model
+	textarea    textarea.Model
+	llmMessages []Message
+	llmApi      func(messages []Message) (<-chan string, error)
+	ch          <-chan string
+	err         error
+}
+
+func initialModel(messages []Message, llmApi func(messages []Message) (<-chan string, error)) chatTuiState {
+	ta := textarea.New()
+	ta.Placeholder = "Type a message..."
+	ta.Focus()
+
+	ta.Prompt = "┃ "
+	// ta.CharLimit = 280
+	ta.MaxHeight = 16
+	ta.FocusedStyle.CursorLine = lipgloss.NewStyle()
+
+	ta.ShowLineNumbers = false
+
+	vp := viewport.New(32, 12)
+	// vp.SetContent(`llm chat ui`)
+
+	ta.KeyMap.InsertNewline.SetEnabled(false)
+
+	vp.SetContent(formatMessageLog(messages))
+	vp.GotoBottom()
+
+	return chatTuiState{
+		textarea:    ta,
+		viewport:    vp,
+		llmMessages: messages,
+		llmApi:      llmApi,
+		ch:          nil,
+		err:         nil,
+	}
+}
+
+func (m chatTuiState) Init() tea.Cmd {
+	return textarea.Blink
+}
+
+func formatMessageLog(msgs []Message) string {
+	var ret string
+	for _, msg := range msgs {
+		ret += fmt.Sprintf("### %s:\n%s\n\n", strings.ToUpper(msg.Role), strings.TrimRight(msg.Content, " \t\r\n"))
+	}
+	return ret
+}
+
+func (m chatTuiState) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var (
+		tiCmd tea.Cmd
+		vpCmd tea.Cmd
+	)
+
+	m.textarea, tiCmd = m.textarea.Update(msg)
+	m.viewport, vpCmd = m.viewport.Update(msg)
+
+	switch msg := msg.(type) {
+
+	case tea.KeyMsg:
+		switch msg.Type {
+
+		case tea.KeyCtrlC, tea.KeyEsc:
+			return m, tea.Quit
+
+		case tea.KeyEnter:
+			m.llmMessages = append(m.llmMessages, Message{
+				Role:    "user",
+				Content: m.textarea.Value(),
+			})
+
+			ch, err := m.llmApi(m.llmMessages)
+
+			if err != nil {
+				log.Println(err)
+				m.err = err
+				return m, nil
+			}
+
+			m.ch = ch
+			m.textarea.Reset()
+			m.textarea.Placeholder = "Type a message..."
+			m.textarea.Focus()
+
+			m.viewport.SetContent(formatMessageLog(m.llmMessages))
+			m.viewport.GotoBottom()
+
+			return m, readLLMResponse(m.ch)
+
+		case tea.KeyBackspace:
+			if len(m.textarea.Value()) > 0 {
+				m.textarea.SetValue(m.textarea.Value()[:len(m.textarea.Value())-1])
+			}
+		}
+
+	case tea.WindowSizeMsg:
+		m.textarea.SetWidth(msg.Width - 2)
+		m.viewport.Width = msg.Width - 2
+		m.viewport.Height = msg.Height - 4 - m.textarea.Height()
+
+	case updateViewportMsg:
+		content := msg.content
+		streaming_done := !msg.streaming
+
+		if streaming_done {
+			return m, nil
+		}
+
+		if len(m.llmMessages) > 0 && m.llmMessages[len(m.llmMessages)-1].Role == "assistant" {
+			m.llmMessages[len(m.llmMessages)-1].Content += content
+		} else {
+			m.llmMessages = append(m.llmMessages, Message{
+				Role:    "assistant",
+				Content: content,
+			})
+		}
+
+		m.viewport.SetContent(formatMessageLog(m.llmMessages))
+		m.viewport.GotoBottom()
+
+		return m, readLLMResponse(m.ch)
+	}
+
+	return m, tea.Batch(tiCmd, vpCmd)
+}
+
+func (m chatTuiState) View() string {
+	return fmt.Sprintf(
+		"%s\n\n%s",
+		m.viewport.View(),
+		m.textarea.View(),
+	) + "\n\n"
+}
+
+func readLLMResponse(ch <-chan string) tea.Cmd {
+	return func() tea.Msg {
+		for content := range ch {
+			return updateViewportMsg{content: content, streaming: true}
+		}
+		return updateViewportMsg{content: "", streaming: false}
+	}
+}
+
+type updateViewportMsg struct {
+	streaming bool
+	content   string
 }

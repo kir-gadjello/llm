@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"fmt"
-	"os"
 
 	"bytes"
 	"encoding/json"
@@ -11,8 +10,15 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
+
+	"os"
 )
+
+func is_interactive(fd uintptr) bool {
+	return isatty.IsTerminal(fd) || isatty.IsCygwinTerminal(fd)
+}
 
 type LLMChatRequest struct {
 	Model       string                 `json:"model"`
@@ -223,13 +229,15 @@ func main() {
 		RunE:  runLLMChat,
 	}
 
+	var is_terminal bool = is_interactive(os.Stdout.Fd())
+
 	rootCmd.Flags().StringP("model", "m", "gpt-3.5-turbo", "LLM model")
+	rootCmd.Flags().StringP("prompt", "p", "", "System prompt")
 	rootCmd.Flags().IntP("seed", "s", 1337, "Random seed")
 	rootCmd.Flags().Float64P("temperature", "t", 0.0, "Temperature")
-	rootCmd.Flags().StringP("postprocess", "p", "", "Postprocessing function (e.g. 'lowercase')")
 	rootCmd.Flags().StringP("api-key", "k", "", "OpenAI API key")
 	rootCmd.Flags().StringP("api-base", "b", "https://api.openai.com/v1/", "OpenAI API base URL")
-	rootCmd.Flags().BoolP("stream", "S", false, "Stream output")
+	rootCmd.Flags().BoolP("stream", "S", is_terminal, "Stream output")
 	rootCmd.Flags().BoolP("verbose", "v", false, "http logging")
 
 	if err := rootCmd.Execute(); err != nil {
@@ -242,19 +250,46 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	model, _ := cmd.Flags().GetString("model")
 	seed, _ := cmd.Flags().GetInt("seed")
 	temperature, _ := cmd.Flags().GetFloat64("temperature")
-	// postprocess, _ := cmd.Flags().GetString("postprocess")
 	apiKey, _ := cmd.Flags().GetString("api-key")
 	apiBase, _ := cmd.Flags().GetString("api-base")
 	stream, _ := cmd.Flags().GetBool("stream")
 	verbose, _ := cmd.Flags().GetBool("v")
+	systemPrompt, _ := cmd.Flags().GetString("prompt")
 
-	messages := make([]Message, len(args))
-	for i, arg := range args {
-		messages[i] = Message{
-			Role:    "user",
-			Content: arg,
+	messages := make([]Message, 0)
+
+	if len(strings.TrimSpace(systemPrompt)) > 0 {
+		messages = append(messages, Message{
+			Role:    "system",
+			Content: systemPrompt,
+		})
+	}
+
+	var usermsg string = ""
+
+	for _, arg := range args {
+		usermsg += arg
+	}
+
+	// Read from stdin if available
+	stat, _ := os.Stdin.Stat()
+	var first = false
+	if (stat.Mode() & os.ModeCharDevice) == 0 {
+		// stdin is a pipe or a file, read from it
+		scanner := bufio.NewScanner(os.Stdin)
+		for scanner.Scan() {
+			if first {
+				usermsg += " "
+				first = false
+			}
+			usermsg += scanner.Text()
 		}
 	}
+
+	messages = append(messages, Message{
+		Role:    "user",
+		Content: usermsg,
+	})
 
 	ch, err := llmChat(messages, model, seed, temperature, nil, apiKey, apiBase, stream, nil, verbose)
 

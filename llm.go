@@ -260,7 +260,7 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	apiBase, _ := cmd.Flags().GetString("api-base")
 	stream, _ := cmd.Flags().GetBool("stream")
 	verbose, _ := cmd.Flags().GetBool("v")
-	chat, _ := cmd.Flags().GetBool("c")
+	chat, _ := cmd.Flags().GetBool("chat")
 	systemPrompt, _ := cmd.Flags().GetString("prompt")
 
 	messages := make([]Message, 0)
@@ -290,14 +290,8 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 				first = false
 			}
 			usermsg += scanner.Text()
+			usermsg += " "
 		}
-	}
-
-	if len(usermsg) > 0 {
-		messages = append(messages, Message{
-			Role:    "user",
-			Content: usermsg,
-		})
 	}
 
 	llmApiFunc := func(messages []Message) (<-chan string, error) {
@@ -305,7 +299,14 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	}
 
 	if len(usermsg) == 0 || chat {
-		p := tea.NewProgram(initialModel(messages, llmApiFunc))
+
+		var initialTextareaValue = ""
+
+		if len(usermsg) > 0 {
+			initialTextareaValue = usermsg
+		}
+
+		p := tea.NewProgram(initialModel(messages, llmApiFunc, initialTextareaValue))
 
 		if _, err := p.Run(); err != nil {
 			log.Println(err)
@@ -315,6 +316,13 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 		// TODO: save history
 
 		return nil
+	}
+
+	if len(usermsg) > 0 {
+		messages = append(messages, Message{
+			Role:    "user",
+			Content: usermsg,
+		})
 	}
 
 	ch, err := llmChat(messages, modelname, seed, temperature, nil, apiKey, apiBase, stream, nil, verbose)
@@ -377,7 +385,7 @@ type chatTuiState struct {
 	err         error
 }
 
-func initialModel(messages []Message, llmApi func(messages []Message) (<-chan string, error)) chatTuiState {
+func initialModel(messages []Message, llmApi func(messages []Message) (<-chan string, error), initialTextareaValue string) chatTuiState {
 	ta := textarea.New()
 	ta.Placeholder = "Type a message..."
 	ta.Focus()
@@ -386,15 +394,18 @@ func initialModel(messages []Message, llmApi func(messages []Message) (<-chan st
 	// ta.CharLimit = 280
 	ta.MaxHeight = 16
 	ta.FocusedStyle.CursorLine = lipgloss.NewStyle()
-
 	ta.ShowLineNumbers = false
 
 	vp := viewport.New(32, 12)
-	// vp.SetContent(`llm chat ui`)
+	vp.SetContent(`<llm chat history is empty>`)
 
 	ta.KeyMap.InsertNewline.SetEnabled(false)
 
-	vp.SetContent(formatMessageLog(messages))
+	ta.SetValue(initialTextareaValue)
+
+	if len(messages) > 0 {
+		vp.SetContent(formatMessageLog(messages))
+	}
 	vp.GotoBottom()
 
 	return chatTuiState{
@@ -436,10 +447,49 @@ func (m chatTuiState) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.KeyCtrlC, tea.KeyEsc:
 			return m, tea.Quit
 
+		case tea.KeyCtrlN: // ctrl+N
+			m.llmMessages = []Message{}
+
+			m.textarea.Reset()
+			m.textarea.Placeholder = "Type a message..."
+			m.textarea.Focus()
+
+			m.viewport.SetContent(`<llm chat history is empty>`)
+			// m.viewport.SetContent(formatMessageLog(m.llmMessages))
+			m.viewport.GotoBottom()
+
+			return m, nil
+
+		case tea.KeyCtrlD: // ctrl+N
+			if len(m.llmMessages) > 0 && m.llmMessages[len(m.llmMessages)-1].Role == "user" {
+				m.llmMessages = m.llmMessages[:len(m.llmMessages)-1]
+
+			}
+
+			if len(m.llmMessages) > 0 && m.llmMessages[len(m.llmMessages)-1].Role == "assistant" {
+				m.llmMessages = m.llmMessages[:len(m.llmMessages)-1]
+
+			}
+
+			m.viewport.SetContent(formatMessageLog(m.llmMessages))
+			m.viewport.GotoBottom()
+
+			return m, nil
+
 		case tea.KeyEnter:
+
+			var usermsg = m.textarea.Value()
+
+			// if len(m.llmMessages) > 0 && m.llmMessages[len(m.llmMessages)-1].Role == "user" {
+			// 	// TODO customize
+			// 	var lastmsg = m.llmMessages[len(m.llmMessages)-1]
+			// 	var content = "# Input context:\n" + lastmsg.Content + "\n" + "# User query:\n" +
+
+			// }
+
 			m.llmMessages = append(m.llmMessages, Message{
 				Role:    "user",
-				Content: m.textarea.Value(),
+				Content: usermsg,
 			})
 
 			ch, err := m.llmApi(m.llmMessages)
@@ -459,12 +509,13 @@ func (m chatTuiState) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport.GotoBottom()
 
 			return m, readLLMResponse(m.ch)
-
-		case tea.KeyBackspace:
-			if len(m.textarea.Value()) > 0 {
-				m.textarea.SetValue(m.textarea.Value()[:len(m.textarea.Value())-1])
-			}
 		}
+
+		// case tea.KeyBackspace:
+		// 	if len(m.textarea.Value()) > 0 {
+		// 		m.textarea.SetValue(m.textarea.Value()[:len(m.textarea.Value())-1])
+		// 	}
+		// }
 
 	case tea.WindowSizeMsg:
 		m.textarea.SetWidth(msg.Width - 2)

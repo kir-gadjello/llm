@@ -2,14 +2,22 @@ package main
 
 import (
 	"bufio"
-	"fmt"
-	"log"
-
 	"bytes"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -17,8 +25,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
-
-	"os"
+	markdown "github.com/vlanse/go-term-markdown"
 )
 
 func is_interactive(fd uintptr) bool {
@@ -227,6 +234,93 @@ func llmChat(
 	return ch, nil
 }
 
+func putTextIntoClipboard(text string) error {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin": // macOS
+		cmd := exec.Command("pbcopy")
+		stdin, err := cmd.StdinPipe()
+		if err != nil {
+			return err
+		}
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		err = cmd.Start()
+		if err != nil {
+			return err
+		}
+		_, err = stdin.Write([]byte(text))
+		if err != nil {
+			return err
+		}
+		err = stdin.Close()
+		if err != nil {
+			return err
+		}
+		err = cmd.Wait()
+		if err != nil {
+			return err
+		}
+		return nil
+	case "linux":
+		cmd = exec.Command("xclip", "-selection", "clipboard", text)
+		return cmd.Run()
+	case "windows":
+		cmd = exec.Command("clip", text)
+		return cmd.Run()
+	default:
+		return errors.New("unsupported OS")
+	}
+}
+
+type Session struct {
+	UUID      string
+	Timestamp time.Time
+}
+
+func newSession() *Session {
+	uuid, err := generateUUID()
+	if err != nil {
+		log.Fatal(err)
+	}
+	return &Session{UUID: uuid, Timestamp: time.Now()}
+}
+
+func generateUUID() (string, error) {
+	u := make([]byte, 16)
+	_, err := rand.Read(u)
+	if err != nil {
+		return "", err
+	}
+	return base64.URLEncoding.EncodeToString(u), nil
+}
+
+func dumpToHistory(session *Session, data interface{}) error {
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		return err
+	}
+	historyDir := filepath.Join(configDir, "llmcli")
+	if _, err := os.Stat(historyDir); os.IsNotExist(err) {
+		if err := os.MkdirAll(historyDir, 0o755); err != nil {
+			return err
+		}
+	}
+	historyFile := filepath.Join(historyDir, "history.jsonl")
+	f, err := os.OpenFile(historyFile, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		return err
+	}
+	jsonString := string(jsonData) + "\n"
+	_, err = f.WriteString(jsonString)
+	return err
+}
+
 func main() {
 	rootCmd := &cobra.Command{
 		Use:   "llm-chat",
@@ -253,6 +347,8 @@ func main() {
 }
 
 func runLLMChat(cmd *cobra.Command, args []string) error {
+	// session := newSession()
+
 	modelname, _ := cmd.Flags().GetString("model")
 	seed, _ := cmd.Flags().GetInt("seed")
 	temperature, _ := cmd.Flags().GetFloat64("temperature")
@@ -306,7 +402,8 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 			initialTextareaValue = usermsg
 		}
 
-		p := tea.NewProgram(initialModel(messages, llmApiFunc, initialTextareaValue))
+		p := tea.NewProgram(initialModel(messages, llmApiFunc, initialTextareaValue), // use the full size of the terminal in its "alternate screen buffer"
+			tea.WithMouseCellMotion())
 
 		if _, err := p.Run(); err != nil {
 			log.Println(err)
@@ -324,6 +421,9 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 			Content: usermsg,
 		})
 	}
+
+	// dumpToHistory(session *Session, data interface{})
+	// dumpToHistory(session, )
 
 	ch, err := llmChat(messages, modelname, seed, temperature, nil, apiKey, apiBase, stream, nil, verbose)
 
@@ -377,12 +477,15 @@ func (t *loggingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 }
 
 type chatTuiState struct {
-	viewport    viewport.Model
-	textarea    textarea.Model
-	llmMessages []Message
-	llmApi      func(messages []Message) (<-chan string, error)
-	ch          <-chan string
-	err         error
+	viewport       viewport.Model
+	textarea       textarea.Model
+	llmMessages    []Message
+	llmApi         func(messages []Message) (<-chan string, error)
+	ch             <-chan string
+	err            error
+	renderMarkdown bool
+	viewportWidth  int
+	mdPaddingWidth int
 }
 
 func initialModel(messages []Message, llmApi func(messages []Message) (<-chan string, error), initialTextareaValue string) chatTuiState {
@@ -398,23 +501,27 @@ func initialModel(messages []Message, llmApi func(messages []Message) (<-chan st
 
 	vp := viewport.New(32, 12)
 	vp.SetContent(`<llm chat history is empty>`)
-
+	// vp.HighPerformanceRendering = true
+	vp.MouseWheelEnabled = true
 	ta.KeyMap.InsertNewline.SetEnabled(false)
 
 	ta.SetValue(initialTextareaValue)
 
 	if len(messages) > 0 {
-		vp.SetContent(formatMessageLog(messages))
+		vp.SetContent(formatMessageLog(messages, true, 80, 0))
 	}
 	vp.GotoBottom()
 
 	return chatTuiState{
-		textarea:    ta,
-		viewport:    vp,
-		llmMessages: messages,
-		llmApi:      llmApi,
-		ch:          nil,
-		err:         nil,
+		textarea:       ta,
+		viewport:       vp,
+		llmMessages:    messages,
+		llmApi:         llmApi,
+		ch:             nil,
+		err:            nil,
+		renderMarkdown: true,
+		viewportWidth:  80,
+		mdPaddingWidth: 0,
 	}
 }
 
@@ -422,10 +529,33 @@ func (m chatTuiState) Init() tea.Cmd {
 	return textarea.Blink
 }
 
-func formatMessageLog(msgs []Message) string {
+var markdownCache = struct {
+	sync.Mutex
+	cache map[string]string
+}{cache: make(map[string]string)}
+
+func formatMessageLog(msgs []Message, render_markdown bool, lineWidth int, mdPadding int) string {
 	var ret string
+
 	for _, msg := range msgs {
-		ret += fmt.Sprintf("### %s:\n%s\n\n", strings.ToUpper(msg.Role), strings.TrimRight(msg.Content, " \t\r\n"))
+		var content = strings.TrimRight(msg.Content, " \t\r\n")
+
+		if render_markdown {
+			var key = fmt.Sprintf("%s__%s__%s", content, &lineWidth, &mdPadding)
+			markdownCache.Lock()
+			if cachedContent, ok := markdownCache.cache[key]; ok {
+				markdownCache.Unlock()
+				content = cachedContent
+			} else {
+				content = string(markdown.Render(content, lineWidth, mdPadding))
+				markdownCache.cache[key] = content
+				markdownCache.Unlock()
+			}
+		}
+
+		content = strings.TrimRight(content, " \t\r\n")
+
+		ret += fmt.Sprintf("### %s:\n%s\n\n", strings.ToUpper(msg.Role), content)
 	}
 	return ret
 }
@@ -460,10 +590,15 @@ func (m chatTuiState) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			return m, nil
 
+		case tea.KeyCtrlE: // ctrl+E: copy
+			if len(m.llmMessages) > 0 {
+				putTextIntoClipboard(m.llmMessages[len(m.llmMessages)-1].Content)
+			}
+			return m, nil
+
 		case tea.KeyCtrlD: // ctrl+N
 			if len(m.llmMessages) > 0 && m.llmMessages[len(m.llmMessages)-1].Role == "user" {
 				m.llmMessages = m.llmMessages[:len(m.llmMessages)-1]
-
 			}
 
 			if len(m.llmMessages) > 0 && m.llmMessages[len(m.llmMessages)-1].Role == "assistant" {
@@ -471,7 +606,7 @@ func (m chatTuiState) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			}
 
-			m.viewport.SetContent(formatMessageLog(m.llmMessages))
+			m.viewport.SetContent(formatMessageLog(m.llmMessages, m.renderMarkdown, m.viewportWidth, m.mdPaddingWidth))
 			m.viewport.GotoBottom()
 
 			return m, nil
@@ -505,7 +640,7 @@ func (m chatTuiState) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.textarea.Placeholder = "Type a message..."
 			m.textarea.Focus()
 
-			m.viewport.SetContent(formatMessageLog(m.llmMessages))
+			m.viewport.SetContent(formatMessageLog(m.llmMessages, m.renderMarkdown, m.viewportWidth, m.mdPaddingWidth))
 			m.viewport.GotoBottom()
 
 			return m, readLLMResponse(m.ch)
@@ -520,6 +655,7 @@ func (m chatTuiState) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.textarea.SetWidth(msg.Width - 2)
 		m.viewport.Width = msg.Width - 2
+		m.viewportWidth = msg.Width - 2
 		m.viewport.Height = msg.Height - 4 - m.textarea.Height()
 
 	case updateViewportMsg:
@@ -539,7 +675,7 @@ func (m chatTuiState) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			})
 		}
 
-		m.viewport.SetContent(formatMessageLog(m.llmMessages))
+		m.viewport.SetContent(formatMessageLog(m.llmMessages, m.renderMarkdown, m.viewportWidth, m.mdPaddingWidth))
 		m.viewport.GotoBottom()
 
 		return m, readLLMResponse(m.ch)

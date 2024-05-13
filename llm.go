@@ -42,8 +42,19 @@ type LLMChatRequest struct {
 }
 
 type Message struct {
+	UUID    string `json:"uuid"`
 	Role    string `json:"role"`
 	Content string `json:"content"`
+}
+
+func NewMessage(role, content string) *Message {
+	uuid := generateUUID()
+
+	return &Message{
+		UUID:    uuid,
+		Role:    role,
+		Content: content,
+	}
 }
 
 func llmChat(
@@ -91,8 +102,6 @@ func llmChat(
 		return nil, err
 	}
 
-	// fmt.Println(req)
-
 	var client *http.Client
 
 	if verbose {
@@ -127,8 +136,6 @@ func llmChat(
 			for scanner.Scan() {
 				line := scanner.Text()
 
-				// fmt.Println(line)
-
 				if err != nil {
 					if err != io.EOF {
 						fmt.Println(err)
@@ -139,8 +146,6 @@ func llmChat(
 				line = strings.TrimSpace(line)
 
 				if strings.HasPrefix(line, "data: ") {
-					// fmt.Println(line)
-
 					var resp struct {
 						Choices []struct {
 							Delta struct {
@@ -192,8 +197,6 @@ func llmChat(
 
 		return ch, nil
 	}
-
-	// println(url + "/chat/completions")
 
 	httpReq, err := http.NewRequest("POST", url+"/chat/completions", bytes.NewBuffer(jsonData))
 
@@ -279,20 +282,17 @@ type Session struct {
 }
 
 func newSession() *Session {
-	uuid, err := generateUUID()
-	if err != nil {
-		log.Fatal(err)
-	}
+	uuid := generateUUID()
 	return &Session{UUID: uuid, Timestamp: time.Now()}
 }
 
-func generateUUID() (string, error) {
+func generateUUID() string {
 	u := make([]byte, 16)
 	_, err := rand.Read(u)
 	if err != nil {
-		return "", err
+		return fmt.Sprintf("%s", time.Now().UnixMilli())
 	}
-	return base64.URLEncoding.EncodeToString(u), nil
+	return base64.URLEncoding.EncodeToString(u)
 }
 
 func dumpToHistory(session *Session, data interface{}) error {
@@ -346,8 +346,31 @@ func main() {
 	}
 }
 
+func markChatStart(session *Session, userMsg, systemPrompt, model string, seed int, temperature float64, apiBase string) error {
+	data := struct {
+		SID          string  `json:"sid"`
+		TS           int     `json:"ts"`
+		UserMsg      string  `json:"user_msg"`
+		SystemPrompt string  `json:"system_prompt"`
+		Model        string  `json:"model"`
+		Seed         int     `json:"seed"`
+		Temperature  float64 `json:"temperature"`
+		APIBase      string  `json:"api_base"`
+	}{
+		SID:          session.UUID,
+		TS:           int(time.Now().Unix()),
+		UserMsg:      userMsg,
+		SystemPrompt: systemPrompt,
+		Model:        model,
+		Seed:         seed,
+		Temperature:  temperature,
+		APIBase:      apiBase,
+	}
+	return dumpToHistory(session, data)
+}
+
 func runLLMChat(cmd *cobra.Command, args []string) error {
-	// session := newSession()
+	session := newSession()
 
 	modelname, _ := cmd.Flags().GetString("model")
 	seed, _ := cmd.Flags().GetInt("seed")
@@ -362,10 +385,7 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	messages := make([]Message, 0)
 
 	if len(strings.TrimSpace(systemPrompt)) > 0 {
-		messages = append(messages, Message{
-			Role:    "system",
-			Content: systemPrompt,
-		})
+		messages = append(messages, *NewMessage("system", systemPrompt))
 	}
 
 	var usermsg string = ""
@@ -390,8 +410,26 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	markChatStart(session, usermsg, systemPrompt, modelname, seed, temperature, apiBase)
+
 	llmApiFunc := func(messages []Message) (<-chan string, error) {
 		return llmChat(messages, modelname, seed, temperature, nil, apiKey, apiBase, true, nil, verbose)
+	}
+
+	llmHistoryFunc := func(msg Message) error {
+		data := struct {
+			ID      string  `json:"uuid"`
+			SID     string  `json:"sid"`
+			TS      int     `json:"ts"`
+			Message Message `json:"msg"`
+		}{
+			ID:      msg.UUID,
+			SID:     session.UUID,
+			TS:      time.Now().Second(),
+			Message: msg,
+		}
+
+		return dumpToHistory(session, data)
 	}
 
 	if len(usermsg) == 0 || chat {
@@ -402,7 +440,7 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 			initialTextareaValue = usermsg
 		}
 
-		p := tea.NewProgram(initialModel(messages, llmApiFunc, initialTextareaValue), // use the full size of the terminal in its "alternate screen buffer"
+		p := tea.NewProgram(initialModel(*session, messages, llmHistoryFunc, llmApiFunc, initialTextareaValue), // use the full size of the terminal in its "alternate screen buffer"
 			tea.WithMouseCellMotion())
 
 		if _, err := p.Run(); err != nil {
@@ -410,20 +448,12 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 			return err
 		}
 
-		// TODO: save history
-
 		return nil
 	}
 
 	if len(usermsg) > 0 {
-		messages = append(messages, Message{
-			Role:    "user",
-			Content: usermsg,
-		})
+		messages = append(messages, *NewMessage("user", usermsg))
 	}
-
-	// dumpToHistory(session *Session, data interface{})
-	// dumpToHistory(session, )
 
 	ch, err := llmChat(messages, modelname, seed, temperature, nil, apiKey, apiBase, stream, nil, verbose)
 
@@ -481,21 +511,31 @@ type chatTuiState struct {
 	textarea       textarea.Model
 	llmMessages    []Message
 	llmApi         func(messages []Message) (<-chan string, error)
+	historyApi     func(Message) error
+	session        Session
 	ch             <-chan string
 	err            error
 	renderMarkdown bool
 	viewportWidth  int
 	mdPaddingWidth int
+	shift          bool
 }
 
-func initialModel(messages []Message, llmApi func(messages []Message) (<-chan string, error), initialTextareaValue string) chatTuiState {
+func getLastMsg(m chatTuiState) (Message, error) {
+	if len(m.llmMessages) == 0 {
+		return Message{}, errors.New("no messages in history")
+	}
+	return m.llmMessages[len(m.llmMessages)-1], nil
+}
+
+func initialModel(session Session, messages []Message, llmHistoryApi func(Message) error, llmApi func(messages []Message) (<-chan string, error), initialTextareaValue string) chatTuiState {
 	ta := textarea.New()
 	ta.Placeholder = "Type a message..."
 	ta.Focus()
 
 	ta.Prompt = "┃ "
-	// ta.CharLimit = 280
-	ta.MaxHeight = 16
+	ta.CharLimit = 100000
+	ta.MaxHeight = 32
 	ta.FocusedStyle.CursorLine = lipgloss.NewStyle()
 	ta.ShowLineNumbers = false
 
@@ -517,6 +557,8 @@ func initialModel(messages []Message, llmApi func(messages []Message) (<-chan st
 		viewport:       vp,
 		llmMessages:    messages,
 		llmApi:         llmApi,
+		historyApi:     llmHistoryApi,
+		session:        session,
 		ch:             nil,
 		err:            nil,
 		renderMarkdown: true,
@@ -527,6 +569,38 @@ func initialModel(messages []Message, llmApi func(messages []Message) (<-chan st
 
 func (m chatTuiState) Init() tea.Cmd {
 	return textarea.Blink
+}
+
+func removeLastMsg(m chatTuiState) error {
+	for len(m.llmMessages) > 0 {
+		lastMsg, err := getLastMsg(m)
+		if err != nil {
+			return err
+		}
+
+		if lastMsg.Role == "assistant" {
+			break
+		}
+
+		pseudoMsg := NewMessage("__sys__", fmt.Sprintf(`{"sysop": "remove_msg", "id": "%s"}`, lastMsg))
+		m.historyApi(*pseudoMsg)
+
+		m.llmMessages = m.llmMessages[:len(m.llmMessages)-1]
+	}
+
+	if len(m.llmMessages) > 0 {
+		lastMsg, err := getLastMsg(m)
+		if err != nil {
+			return err
+		}
+
+		pseudoMsg := NewMessage("__sys__", fmt.Sprintf(`{"sysop": "remove_msg", "id": "%s"}`, lastMsg.UUID))
+		m.historyApi(*pseudoMsg)
+
+		m.llmMessages = m.llmMessages[:len(m.llmMessages)-1]
+	}
+
+	return nil
 }
 
 var markdownCache = struct {
@@ -590,21 +664,36 @@ func (m chatTuiState) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			return m, nil
 
+		case tea.KeyShiftDown:
+			m.shift = true
+			return m, nil
+
+		case tea.KeyShiftUp:
+			m.shift = false
+			return m, nil
+
+		case tea.KeyCtrlS: // ctrl+E: copy
+			if len(m.llmMessages) > 0 {
+				putTextIntoClipboard(formatMessageLog(m.llmMessages, false, 0, 0))
+			}
+			return m, nil
+
 		case tea.KeyCtrlE: // ctrl+E: copy
+			// if m.shift {
+			// 	putTextIntoClipboard(formatMessageLog(m.llmMessages, false, 0, 0))
+			// } else {
+			// 	// Copy last message
+			// 	if len(m.llmMessages) > 0 {
+			// 		putTextIntoClipboard(m.llmMessages[len(m.llmMessages)-1].Content)
+			// 	}
+			// }
 			if len(m.llmMessages) > 0 {
 				putTextIntoClipboard(m.llmMessages[len(m.llmMessages)-1].Content)
 			}
 			return m, nil
 
 		case tea.KeyCtrlD: // ctrl+N
-			if len(m.llmMessages) > 0 && m.llmMessages[len(m.llmMessages)-1].Role == "user" {
-				m.llmMessages = m.llmMessages[:len(m.llmMessages)-1]
-			}
-
-			if len(m.llmMessages) > 0 && m.llmMessages[len(m.llmMessages)-1].Role == "assistant" {
-				m.llmMessages = m.llmMessages[:len(m.llmMessages)-1]
-
-			}
+			removeLastMsg(m)
 
 			m.viewport.SetContent(formatMessageLog(m.llmMessages, m.renderMarkdown, m.viewportWidth, m.mdPaddingWidth))
 			m.viewport.GotoBottom()
@@ -615,6 +704,10 @@ func (m chatTuiState) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			var usermsg = m.textarea.Value()
 
+			if len(strings.Trim(usermsg, " \r\t\n")) == 0 {
+				return m, nil
+			}
+
 			// if len(m.llmMessages) > 0 && m.llmMessages[len(m.llmMessages)-1].Role == "user" {
 			// 	// TODO customize
 			// 	var lastmsg = m.llmMessages[len(m.llmMessages)-1]
@@ -622,10 +715,10 @@ func (m chatTuiState) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			// }
 
-			m.llmMessages = append(m.llmMessages, Message{
-				Role:    "user",
-				Content: usermsg,
-			})
+			var newmsg = *NewMessage("user", usermsg)
+
+			m.llmMessages = append(m.llmMessages, newmsg)
+			m.historyApi(newmsg)
 
 			ch, err := m.llmApi(m.llmMessages)
 
@@ -643,7 +736,7 @@ func (m chatTuiState) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport.SetContent(formatMessageLog(m.llmMessages, m.renderMarkdown, m.viewportWidth, m.mdPaddingWidth))
 			m.viewport.GotoBottom()
 
-			return m, readLLMResponse(m.ch)
+			return m, readLLMResponse(m, m.ch)
 		}
 
 		// case tea.KeyBackspace:
@@ -669,16 +762,13 @@ func (m chatTuiState) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if len(m.llmMessages) > 0 && m.llmMessages[len(m.llmMessages)-1].Role == "assistant" {
 			m.llmMessages[len(m.llmMessages)-1].Content += content
 		} else {
-			m.llmMessages = append(m.llmMessages, Message{
-				Role:    "assistant",
-				Content: content,
-			})
+			m.llmMessages = append(m.llmMessages, *NewMessage("assistant", content))
 		}
 
 		m.viewport.SetContent(formatMessageLog(m.llmMessages, m.renderMarkdown, m.viewportWidth, m.mdPaddingWidth))
 		m.viewport.GotoBottom()
 
-		return m, readLLMResponse(m.ch)
+		return m, readLLMResponse(m, m.ch)
 	}
 
 	return m, tea.Batch(tiCmd, vpCmd)
@@ -692,10 +782,14 @@ func (m chatTuiState) View() string {
 	) + "\n\n"
 }
 
-func readLLMResponse(ch <-chan string) tea.Cmd {
+func readLLMResponse(m chatTuiState, ch <-chan string) tea.Cmd {
 	return func() tea.Msg {
 		for content := range ch {
 			return updateViewportMsg{content: content, streaming: true}
+		}
+		var lastMsg, err = getLastMsg(m)
+		if err == nil {
+			m.historyApi(lastMsg)
 		}
 		return updateViewportMsg{content: "", streaming: false}
 	}

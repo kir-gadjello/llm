@@ -349,11 +349,12 @@ func generateUUID() string {
 }
 
 func dumpToHistory(session *Session, data interface{}) error {
-	configDir, err := os.UserConfigDir()
+	configDir, err := os.UserHomeDir()
 	if err != nil {
 		return err
 	}
-	historyDir := filepath.Join(configDir, "llmcli")
+	historyDir := filepath.Join(configDir, ".config/llmcli")
+
 	if _, err := os.Stat(historyDir); os.IsNotExist(err) {
 		if err := os.MkdirAll(historyDir, 0o755); err != nil {
 			return err

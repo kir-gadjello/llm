@@ -497,7 +497,7 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 		}{
 			ID:      msg.UUID,
 			SID:     session.UUID,
-			TS:      time.Now().Second(),
+			TS:      int(time.Now().Unix()),
 			Message: msg,
 		}
 

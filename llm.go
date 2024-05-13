@@ -57,6 +57,24 @@ func NewMessage(role, content string) *Message {
 	}
 }
 
+func resolveLLMApi(apiKey string, apiBase string) (string, string, error) {
+	if apiKey == "" {
+		apiKey = os.Getenv("OPENAI_API_KEY")
+	}
+
+	if apiKey == "" && strings.Contains(apiBase, "api.openai.com") {
+		return "", "", fmt.Errorf("must provide OpenAI API key")
+	}
+
+	url := os.Getenv("OPENAI_API_BASE")
+	if url == "" {
+		url = apiBase
+	}
+	url = strings.TrimSuffix(url, "/")
+
+	return apiKey, url, nil
+}
+
 func llmChat(
 	messages []Message,
 	model string,
@@ -69,19 +87,10 @@ func llmChat(
 	extra map[string]interface{},
 	verbose bool,
 ) (<-chan string, error) {
-	if apiKey == "" {
-		apiKey = os.Getenv("OPENAI_API_KEY")
+	apiKey, apiBase, err := resolveLLMApi(apiKey, apiBase)
+	if err != nil {
+		log.Fatal(err)
 	}
-
-	if apiKey == "" && strings.Contains(apiBase, "api.openai.com") {
-		return nil, fmt.Errorf("must provide OpenAI API key")
-	}
-
-	url := os.Getenv("OPENAI_API_BASE")
-	if url == "" {
-		url = apiBase
-	}
-	url = strings.TrimSuffix(url, "/")
 
 	headers := http.Header{
 		"Authorization": {"Bearer " + apiKey},
@@ -116,7 +125,7 @@ func llmChat(
 
 	if stream {
 		headers.Set("Accept", "text/event-stream")
-		httpReq, err := http.NewRequest("POST", url+"/chat/completions", bytes.NewBuffer(jsonData))
+		httpReq, err := http.NewRequest("POST", apiBase+"/chat/completions", bytes.NewBuffer(jsonData))
 		if err != nil {
 			return nil, err
 		}
@@ -198,7 +207,7 @@ func llmChat(
 		return ch, nil
 	}
 
-	httpReq, err := http.NewRequest("POST", url+"/chat/completions", bytes.NewBuffer(jsonData))
+	httpReq, err := http.NewRequest("POST", apiBase+"/chat/completions", bytes.NewBuffer(jsonData))
 
 	if err != nil {
 		return nil, err
@@ -235,6 +244,47 @@ func llmChat(
 	close(ch)
 
 	return ch, nil
+}
+
+type Model struct {
+	ID   string                 `json:"id"`
+	Meta map[string]interface{} `json:"meta"`
+}
+
+type ModelList struct {
+	Object string  `json:"object"`
+	Data   []Model `json:"data"`
+}
+
+func getModelList(apiKey string, apiBase string, timeout time.Duration) ([]Model, error) {
+	url := apiBase + "/v1/models"
+	headers := http.Header{
+		"Authorization": {"Bearer " + apiKey},
+		"Content-Type":  {"application/json"},
+	}
+
+	client := &http.Client{
+		Timeout: timeout, // set the timeout for the client
+	}
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header = headers
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var modelList ModelList
+	err = json.NewDecoder(resp.Body).Decode(&modelList)
+	if err != nil {
+		return nil, err
+	}
+
+	return modelList.Data, nil
 }
 
 func putTextIntoClipboard(text string) error {
@@ -407,6 +457,22 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 			}
 			usermsg += scanner.Text()
 			usermsg += " "
+		}
+	}
+
+	apiKey, apiBase, err := resolveLLMApi(apiKey, apiBase)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	timeout := 1 * time.Second // set a 10-second timeout
+	models, err := getModelList(apiKey, apiBase, timeout)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if verbose {
+		for _, model := range models {
+			fmt.Println(model.ID, model.Meta)
 		}
 	}
 

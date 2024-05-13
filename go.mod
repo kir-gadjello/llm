@@ -10,7 +10,10 @@ require github.com/charmbracelet/bubbletea v0.26.2
 
 require github.com/charmbracelet/bubbles v0.18.0
 
-require github.com/charmbracelet/lipgloss v0.9.1
+require (
+	github.com/charmbracelet/lipgloss v0.9.1
+	github.com/vlanse/go-term-markdown v0.0.1-dev2
+)
 
 require (
 	github.com/MichaelMure/go-term-text v0.3.1 // indirect
@@ -36,8 +39,6 @@ require (
 	github.com/muesli/termenv v0.15.2 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/spf13/pflag v1.0.5 // indirect
-	github.com/tsl0922/ttyd v0.0.0-20240330030451-40e79c706be1 // indirect
-	github.com/vlanse/go-term-markdown v0.0.1-dev2 // indirect
 	golang.org/x/image v0.15.0 // indirect
 	golang.org/x/net v0.21.0 // indirect
 	golang.org/x/sync v0.7.0 // indirect

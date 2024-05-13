@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -27,6 +28,8 @@ import (
 	"github.com/spf13/cobra"
 	markdown "github.com/vlanse/go-term-markdown"
 )
+
+var TEXTINPUT_PLACEHOLDER = "Type a message and press Enter to send..."
 
 func is_interactive(fd uintptr) bool {
 	return isatty.IsTerminal(fd) || isatty.IsCygwinTerminal(fd)
@@ -389,6 +392,8 @@ func main() {
 	rootCmd.Flags().StringP("api-base", "b", "https://api.openai.com/v1/", "OpenAI API base URL")
 	rootCmd.Flags().BoolP("stream", "S", is_terminal, "Stream output")
 	rootCmd.Flags().BoolP("verbose", "v", false, "http logging")
+	rootCmd.Flags().StringSliceP("files", "f", []string{}, "List of files and directories")
+	rootCmd.Flags().StringP("file-input-format", "i", "md", "File input format (md|xml)")
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Println(err)
@@ -573,6 +578,9 @@ func (t *loggingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 }
 
 type chatTuiState struct {
+	spin           bool
+	streaming      bool
+	spinner        spinner.Model
 	viewport       viewport.Model
 	textarea       textarea.Model
 	llmMessages    []Message
@@ -614,11 +622,16 @@ func initialModel(session Session, messages []Message, llmHistoryApi func(Messag
 	ta.SetValue(initialTextareaValue)
 
 	if len(messages) > 0 {
-		vp.SetContent(formatMessageLog(messages, true, 80, 0))
+		vp.SetContent(formatMessageLog(messages, true, 80, 0, "", "", true))
 	}
 	vp.GotoBottom()
 
+	sp := spinner.New()
+
 	return chatTuiState{
+		spin:           false,
+		streaming:      false,
+		spinner:        sp,
 		textarea:       ta,
 		viewport:       vp,
 		llmMessages:    messages,
@@ -634,7 +647,7 @@ func initialModel(session Session, messages []Message, llmHistoryApi func(Messag
 }
 
 func (m chatTuiState) Init() tea.Cmd {
-	return textarea.Blink
+	return tea.Batch(textarea.Blink)
 }
 
 func removeLastMsg(m chatTuiState) error {
@@ -674,36 +687,63 @@ var markdownCache = struct {
 	cache map[string]string
 }{cache: make(map[string]string)}
 
-func formatMessageLog(msgs []Message, render_markdown bool, lineWidth int, mdPadding int) string {
-	var ret string
+func formatMessageLog(msgs []Message, renderMarkdown bool, lineWidth int,
+	mdPadding int, suffix string, roleFormat string, renderNewlinesInUsermsgs bool) string {
 
-	for _, msg := range msgs {
-		var content = strings.TrimRight(msg.Content, " \t\r\n")
+	roleFmt := "### %s:\n"
+	if roleFormat != "" {
+		roleFmt = roleFormat
+	}
 
-		if render_markdown {
-			var key = fmt.Sprintf("%s__%s__%s", content, &lineWidth, &mdPadding)
+	var ret strings.Builder
+
+	for i, msg := range msgs {
+		content := strings.TrimRight(msg.Content, " \t\r\n")
+
+		if msg.Role == "user" && renderNewlinesInUsermsgs {
+			content = strings.ReplaceAll(content, "\n", "  \n")
+		}
+
+		if renderMarkdown {
+			key := fmt.Sprintf("%s__%s__%s", content, lineWidth, mdPadding)
 			markdownCache.Lock()
 			if cachedContent, ok := markdownCache.cache[key]; ok {
 				markdownCache.Unlock()
 				content = cachedContent
 			} else {
-				content = string(markdown.Render(content, lineWidth, mdPadding))
-				markdownCache.cache[key] = content
+				renderedContent := markdown.Render(content, lineWidth, mdPadding)
+				markdownCache.cache[key] = string(renderedContent)
 				markdownCache.Unlock()
+				content = string(renderedContent)
 			}
 		}
 
 		content = strings.TrimRight(content, " \t\r\n")
 
-		ret += fmt.Sprintf("### %s:\n%s\n\n", strings.ToUpper(msg.Role), content)
+		sfx := ""
+		if i == len(msgs)-1 && len(suffix) > 0 {
+			sfx = suffix
+		}
+
+		fmt.Fprintf(&ret, roleFmt+"%s%s\n\n", strings.ToUpper(msg.Role), content, sfx)
 	}
-	return ret
+
+	return ret.String()
+}
+
+type tickMsg time.Time
+
+func tickCmd() tea.Cmd {
+	return tea.Tick(time.Second*1, func(t time.Time) tea.Msg {
+		return tickMsg(t)
+	})
 }
 
 func (m chatTuiState) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var (
 		tiCmd tea.Cmd
 		vpCmd tea.Cmd
+		spCmd tea.Cmd
 	)
 
 	m.textarea, tiCmd = m.textarea.Update(msg)
@@ -721,7 +761,7 @@ func (m chatTuiState) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.llmMessages = []Message{}
 
 			m.textarea.Reset()
-			m.textarea.Placeholder = "Type a message..."
+			m.textarea.Placeholder = TEXTINPUT_PLACEHOLDER
 			m.textarea.Focus()
 
 			m.viewport.SetContent(`<llm chat history is empty>`)
@@ -740,7 +780,7 @@ func (m chatTuiState) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case tea.KeyCtrlS: // ctrl+E: copy
 			if len(m.llmMessages) > 0 {
-				putTextIntoClipboard(formatMessageLog(m.llmMessages, false, 0, 0))
+				putTextIntoClipboard(formatMessageLog(m.llmMessages, false, 0, 0, "", "", false))
 			}
 			return m, nil
 
@@ -761,48 +801,58 @@ func (m chatTuiState) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.KeyCtrlD: // ctrl+N
 			removeLastMsg(m)
 
-			m.viewport.SetContent(formatMessageLog(m.llmMessages, m.renderMarkdown, m.viewportWidth, m.mdPaddingWidth))
+			m.viewport.SetContent(formatMessageLog(m.llmMessages, m.renderMarkdown, m.viewportWidth, m.mdPaddingWidth, "", "", true))
 			m.viewport.GotoBottom()
 
 			return m, nil
 
 		case tea.KeyEnter:
+			if msg.Alt {
+				m.textarea.SetValue(m.textarea.Value() + "\n")
+			} else {
+				var usermsg = m.textarea.Value()
 
-			var usermsg = m.textarea.Value()
+				if len(strings.Trim(usermsg, " \r\t\n")) == 0 {
+					return m, nil
+				}
 
-			if len(strings.Trim(usermsg, " \r\t\n")) == 0 {
-				return m, nil
+				// if len(m.llmMessages) > 0 && m.llmMessages[len(m.llmMessages)-1].Role == "user" {
+				// 	// TODO customize
+				// 	var lastmsg = m.llmMessages[len(m.llmMessages)-1]
+				// 	var content = "# Input context:\n" + lastmsg.Content + "\n" + "# User query:\n" +
+
+				// }
+
+				var newmsg = *NewMessage("user", usermsg)
+
+				m.llmMessages = append(m.llmMessages, newmsg)
+				m.historyApi(newmsg)
+
+				ch, err := m.llmApi(m.llmMessages)
+
+				if err != nil {
+					log.Println(err)
+					m.err = err
+					return m, nil
+				}
+
+				m.llmMessages = append(m.llmMessages, *NewMessage("assistant", ""))
+
+				m.spin = true
+				m.spinner.Spinner = spinner.Pulse
+				m.spinner.Spinner.FPS = time.Second / 10
+				m.spinner.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("171"))
+
+				m.ch = ch
+				m.textarea.Reset()
+				m.textarea.Placeholder = TEXTINPUT_PLACEHOLDER
+				m.textarea.Focus()
+
+				m.viewport.SetContent(formatMessageLog(m.llmMessages, m.renderMarkdown, m.viewportWidth, m.mdPaddingWidth, m.spinner.View(), "", true))
+				m.viewport.GotoBottom()
+
+				return m, tea.Batch(tiCmd, vpCmd, spCmd, m.spinner.Tick, readLLMResponse(m, m.ch))
 			}
-
-			// if len(m.llmMessages) > 0 && m.llmMessages[len(m.llmMessages)-1].Role == "user" {
-			// 	// TODO customize
-			// 	var lastmsg = m.llmMessages[len(m.llmMessages)-1]
-			// 	var content = "# Input context:\n" + lastmsg.Content + "\n" + "# User query:\n" +
-
-			// }
-
-			var newmsg = *NewMessage("user", usermsg)
-
-			m.llmMessages = append(m.llmMessages, newmsg)
-			m.historyApi(newmsg)
-
-			ch, err := m.llmApi(m.llmMessages)
-
-			if err != nil {
-				log.Println(err)
-				m.err = err
-				return m, nil
-			}
-
-			m.ch = ch
-			m.textarea.Reset()
-			m.textarea.Placeholder = "Type a message..."
-			m.textarea.Focus()
-
-			m.viewport.SetContent(formatMessageLog(m.llmMessages, m.renderMarkdown, m.viewportWidth, m.mdPaddingWidth))
-			m.viewport.GotoBottom()
-
-			return m, readLLMResponse(m, m.ch)
 		}
 
 		// case tea.KeyBackspace:
@@ -815,13 +865,20 @@ func (m chatTuiState) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.textarea.SetWidth(msg.Width - 2)
 		m.viewport.Width = msg.Width - 2
 		m.viewportWidth = msg.Width - 2
-		m.viewport.Height = msg.Height - 4 - m.textarea.Height()
+		m.viewport.Height = msg.Height - 1 - m.textarea.Height()
 
 	case updateViewportMsg:
 		content := msg.content
 		streaming_done := !msg.streaming
 
+		if m.spin {
+			m.spin = false
+			m.streaming = true
+			m.spinner.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("51"))
+		}
+
 		if streaming_done {
+			m.streaming = false
 			return m, nil
 		}
 
@@ -829,23 +886,37 @@ func (m chatTuiState) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.llmMessages[len(m.llmMessages)-1].Content += content
 		} else {
 			m.llmMessages = append(m.llmMessages, *NewMessage("assistant", content))
+			m.spin = false
 		}
 
-		m.viewport.SetContent(formatMessageLog(m.llmMessages, m.renderMarkdown, m.viewportWidth, m.mdPaddingWidth))
+		m.viewport.SetContent(formatMessageLog(m.llmMessages, m.renderMarkdown, m.viewportWidth, m.mdPaddingWidth, "", "", true))
 		m.viewport.GotoBottom()
 
-		return m, readLLMResponse(m, m.ch)
+		return m, tea.Batch(tiCmd, vpCmd, spCmd, readLLMResponse(m, m.ch))
+
+	default:
+		// fmt.Println(msg)
+	}
+
+	if m.spin || m.streaming {
+		m.spinner, spCmd = m.spinner.Update(msg)
+		return m, tea.Batch(tiCmd, vpCmd, spCmd)
 	}
 
 	return m, tea.Batch(tiCmd, vpCmd)
 }
 
 func (m chatTuiState) View() string {
+
+	if m.spin || m.streaming {
+		m.viewport.SetContent(formatMessageLog(m.llmMessages, m.renderMarkdown, m.viewportWidth, m.mdPaddingWidth, m.spinner.View(), "", true))
+	}
+
 	return fmt.Sprintf(
-		"%s\n\n%s",
+		"%s\n%s",
 		m.viewport.View(),
 		m.textarea.View(),
-	) + "\n\n"
+	) + "\n"
 }
 
 func readLLMResponse(m chatTuiState, ch <-chan string) tea.Cmd {

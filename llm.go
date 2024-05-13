@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -702,7 +703,13 @@ func formatMessageLog(msgs []Message, renderMarkdown bool, lineWidth int,
 		content := strings.TrimRight(msg.Content, " \t\r\n")
 
 		if msg.Role == "user" && renderNewlinesInUsermsgs {
-			content = strings.ReplaceAll(content, "\n", "  \n")
+			re := regexp.MustCompile(`(?m:^(  |\z)|\n)`)
+			content = re.ReplaceAllStringFunc(content, func(match string) string {
+				if strings.HasPrefix(match, "  ") || match == "\n" {
+					return match
+				}
+				return "  \n"
+			})
 		}
 
 		if renderMarkdown {

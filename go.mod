@@ -1,4 +1,4 @@
-module kir-gadjello/artgo/v2
+module github.com/kir-gadjello/llm
 
 go 1.22.2
 

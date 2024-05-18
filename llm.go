@@ -11,8 +11,10 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -36,17 +38,22 @@ func is_interactive(fd uintptr) bool {
 	return isatty.IsTerminal(fd) || isatty.IsCygwinTerminal(fd)
 }
 
-type LLMChatRequest struct {
+type LLMChatRequestBasic struct {
 	Model       string                 `json:"model"`
 	Seed        int                    `json:"seed"`
 	Temperature float64                `json:"temperature"`
 	Stream      bool                   `json:"stream"`
-	Messages    []Message              `json:"messages"`
+	Messages    []LLMMessage           `json:"messages"`
 	Extra       map[string]interface{} `json:"-"`
 }
 
 type Message struct {
 	UUID    string `json:"uuid"`
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type LLMMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
 }
@@ -79,8 +86,35 @@ func resolveLLMApi(apiKey string, apiBase string) (string, string, error) {
 	return apiKey, url, nil
 }
 
+func urlJoin(base, rel string) (string, error) {
+	baseURL, err := url.Parse(base)
+	if err != nil {
+		return "", err
+	}
+
+	relURL, err := url.Parse(rel)
+	if err != nil {
+		return "", err
+	}
+
+	if relURL.Scheme != "" && relURL.Host != "" {
+		return rel, nil
+	}
+
+	joinedPath := path.Join(baseURL.Path, relURL.Path)
+
+	result := &url.URL{
+		Scheme: baseURL.Scheme,
+		User:   baseURL.User,
+		Host:   baseURL.Host,
+		Path:   joinedPath,
+	}
+
+	return result.String(), nil
+}
+
 func llmChat(
-	messages []Message,
+	messages []LLMMessage,
 	model string,
 	seed int,
 	temperature float64,
@@ -101,16 +135,31 @@ func llmChat(
 		"Content-Type":  {"application/json"},
 	}
 
-	req := LLMChatRequest{
+	req := LLMChatRequestBasic{
 		Model:       model,
 		Seed:        seed,
 		Temperature: temperature,
 		Stream:      stream,
 		Messages:    messages,
-		Extra:       extra,
 	}
 
-	jsonData, err := json.Marshal(req)
+	mergedData := map[string]interface{}{}
+
+	reqJson, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+
+	err = json.Unmarshal(reqJson, &mergedData)
+	if err != nil {
+		return nil, err
+	}
+
+	for k, v := range extra {
+		mergedData[k] = v
+	}
+
+	jsonData, err := json.Marshal(mergedData)
 	if err != nil {
 		return nil, err
 	}
@@ -125,11 +174,20 @@ func llmChat(
 		client = &http.Client{}
 	}
 
+	if verbose {
+		fmt.Printf("REQ: %s\n", jsonData)
+	}
+
 	var resp *http.Response
+
+	chatUrl, err := urlJoin(apiBase, "/chat/completions")
+	if err != nil {
+		return nil, err
+	}
 
 	if stream {
 		headers.Set("Accept", "text/event-stream")
-		httpReq, err := http.NewRequest("POST", apiBase+"/chat/completions", bytes.NewBuffer(jsonData))
+		httpReq, err := http.NewRequest("POST", chatUrl, bytes.NewBuffer(jsonData))
 		if err != nil {
 			return nil, err
 		}
@@ -211,7 +269,7 @@ func llmChat(
 		return ch, nil
 	}
 
-	httpReq, err := http.NewRequest("POST", apiBase+"/chat/completions", bytes.NewBuffer(jsonData))
+	httpReq, err := http.NewRequest("POST", chatUrl, bytes.NewBuffer(jsonData))
 
 	if err != nil {
 		return nil, err
@@ -261,7 +319,12 @@ type ModelList struct {
 }
 
 func getModelList(apiKey string, apiBase string, timeout time.Duration) ([]Model, error) {
-	url := apiBase + "/v1/models"
+
+	url, err := urlJoin(apiBase, "models")
+	if err != nil {
+		return nil, err
+	}
+
 	headers := http.Header{
 		"Authorization": {"Bearer " + apiKey},
 		"Content-Type":  {"application/json"},
@@ -391,12 +454,21 @@ func main() {
 	rootCmd.Flags().StringP("prompt", "p", "", "System prompt")
 	rootCmd.Flags().IntP("seed", "s", 1337, "Random seed")
 	rootCmd.Flags().Float64P("temperature", "t", 0.0, "Temperature")
+	rootCmd.Flags().IntP("max_tokens", "N", 4096, "Max amount of tokens in response")
+	rootCmd.Flags().Float64P("frequency_penalty", "Q", 0.0, "Frequency penalty between -2.0 and 2.0")
+	rootCmd.Flags().Float64P("presence_penalty", "Y", 0.0, "Presence penalty between -2.0 and 2.0")
+	rootCmd.Flags().BoolP("json", "j", false, "json mode")
+	rootCmd.Flags().StringP("json-schema", "J", "", "json schema (compatible with llama.cpp and tabbyAPI, not compatible with OpenAI)")
+	rootCmd.Flags().StringP("stop", "X", "", "Stop sequences (a single word or a json array)")
+	rootCmd.Flags().Float64P("top_p", "", 1.0, "Top-P sampling setting, defaults to 1.0")
+	rootCmd.Flags().StringP("api-params", "A", "{}", "Additional LLM API parameters expressed as json, take precedence over provided CLI arguments")
 	rootCmd.Flags().StringP("api-key", "k", "", "OpenAI API key")
 	rootCmd.Flags().StringP("api-base", "b", "https://api.openai.com/v1/", "OpenAI API base URL")
 	rootCmd.Flags().BoolP("stream", "S", is_terminal, "Stream output")
-	rootCmd.Flags().BoolP("verbose", "v", false, "http logging")
+	rootCmd.Flags().BoolP("verbose", "v", false, "http & debug logging")
 	rootCmd.Flags().StringSliceP("files", "f", []string{}, "List of files and directories to include in context")
 	rootCmd.Flags().StringP("context-format", "i", "md", "Context (files) input template format (md|xml)")
+	rootCmd.Flags().BoolP("debug", "D", false, "Output prompt & system msg")
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Println(err)
@@ -404,25 +476,41 @@ func main() {
 	}
 }
 
-func markChatStart(session *Session, userMsg, systemPrompt, model string, seed int, temperature float64, apiBase string) error {
+func markChatStart(session *Session, userMsg, systemPrompt, model string, seed int, temperature float64, apiBase string, maxTokens int, frequencyPenalty, presencePenalty float64, jsonMode bool, stopSequences interface{}, topP float64, apiParams string, jsonSchema string) error {
 	data := struct {
-		SID          string  `json:"sid"`
-		TS           int     `json:"ts"`
-		UserMsg      string  `json:"user_msg"`
-		SystemPrompt string  `json:"system_prompt"`
-		Model        string  `json:"model"`
-		Seed         int     `json:"seed"`
-		Temperature  float64 `json:"temperature"`
-		APIBase      string  `json:"api_base"`
+		SID              string      `json:"sid"`
+		TS               int         `json:"ts"`
+		UserMsg          string      `json:"user_msg"`
+		SystemPrompt     string      `json:"system_prompt"`
+		Model            string      `json:"model"`
+		Seed             int         `json:"seed"`
+		Temperature      float64     `json:"temperature"`
+		APIBase          string      `json:"api_base"`
+		MaxTokens        int         `json:"max_tokens"`
+		FrequencyPenalty float64     `json:"frequency_penalty"`
+		PresencePenalty  float64     `json:"presence_penalty"`
+		JSONMode         bool        `json:"json_mode"`
+		StopSequences    interface{} `json:"stop_sequences"`
+		TopP             float64     `json:"top_p"`
+		APIParams        string      `json:"api_params"`
+		JsonSchema       string      `json:"api_params"`
 	}{
-		SID:          session.UUID,
-		TS:           int(time.Now().Unix()),
-		UserMsg:      userMsg,
-		SystemPrompt: systemPrompt,
-		Model:        model,
-		Seed:         seed,
-		Temperature:  temperature,
-		APIBase:      apiBase,
+		SID:              session.UUID,
+		TS:               int(time.Now().Unix()),
+		UserMsg:          userMsg,
+		SystemPrompt:     systemPrompt,
+		Model:            model,
+		Seed:             seed,
+		Temperature:      temperature,
+		APIBase:          apiBase,
+		MaxTokens:        maxTokens,
+		FrequencyPenalty: frequencyPenalty,
+		PresencePenalty:  presencePenalty,
+		JSONMode:         jsonMode,
+		StopSequences:    stopSequences,
+		TopP:             topP,
+		APIParams:        apiParams,
+		JsonSchema:       jsonSchema,
 	}
 	return dumpToHistory(session, data)
 }
@@ -436,10 +524,31 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	apiKey, _ := cmd.Flags().GetString("api-key")
 	apiBase, _ := cmd.Flags().GetString("api-base")
 	stream, _ := cmd.Flags().GetBool("stream")
-	verbose, _ := cmd.Flags().GetBool("v")
+	verbose, _ := cmd.Flags().GetBool("verbose")
 	chat, _ := cmd.Flags().GetBool("chat")
 	chat_send, _ := cmd.Flags().GetBool("chat-send")
 	systemPrompt, _ := cmd.Flags().GetString("prompt")
+	debug, _ := cmd.Flags().GetBool("debug")
+	maxTokens, _ := cmd.Flags().GetInt("max_tokens")
+	frequencyPenalty, _ := cmd.Flags().GetFloat64("frequency_penalty")
+	presencePenalty, _ := cmd.Flags().GetFloat64("presence_penalty")
+	jsonMode, _ := cmd.Flags().GetBool("json")
+	topP, _ := cmd.Flags().GetFloat64("top_p")
+	apiParams, _ := cmd.Flags().GetString("api-params")
+	jsonSchema, _ := cmd.Flags().GetString("json-schema")
+
+	stopSequences, _ := cmd.Flags().GetString("stop")
+	var stopSeqInterface interface{}
+	if strings.HasPrefix(stopSequences, "[") && strings.HasSuffix(stopSequences, "]") {
+		var stopSeqArray []string
+		err := json.Unmarshal([]byte(stopSequences), &stopSeqArray)
+		if err != nil {
+			log.Fatal(err)
+		}
+		stopSeqInterface = stopSeqArray
+	} else {
+		stopSeqInterface = stopSequences
+	}
 
 	messages := make([]Message, 0)
 
@@ -488,10 +597,62 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	markChatStart(session, usermsg, systemPrompt, modelname, seed, temperature, apiBase)
+	if debug {
+		fmt.Printf("PROMPT: \"%s\"\nSYSTEM MESSAGE: \"%s\"", usermsg, systemPrompt)
+		return nil
+	}
+
+	markChatStart(session, usermsg, systemPrompt, modelname, seed, temperature, apiBase, maxTokens, frequencyPenalty, presencePenalty, jsonMode, stopSeqInterface, topP, apiParams, jsonSchema)
+
+	var extra map[string]interface{}
+
+	apiParamsMap := map[string]interface{}{}
+	if err := json.Unmarshal([]byte(apiParams), &apiParamsMap); err != nil {
+		log.Fatal(err)
+	}
+
+	extra = map[string]interface{}{
+		"max_tokens":        maxTokens,
+		"frequency_penalty": frequencyPenalty,
+		"presence_penalty":  presencePenalty,
+		"top_p":             topP,
+	}
+
+	switch v := stopSeqInterface.(type) {
+	case string:
+		if v != "" {
+			extra["stop"] = v
+		}
+	case []string:
+		if len(v) > 0 {
+			extra["stop"] = v
+		}
+	default:
+	}
+
+	if len(jsonSchema) > 0 {
+		jsonSchemaObj := map[string]interface{}{}
+		if err := json.Unmarshal([]byte(jsonSchema), &jsonSchemaObj); err != nil {
+			log.Fatal(err)
+		}
+		extra["json_schema"] = jsonSchemaObj
+	} else if jsonMode {
+		extra["response_format"] = map[string]interface{}{"type": "json_object"}
+	}
+
+	for k, v := range apiParamsMap {
+		extra[k] = v
+	}
 
 	llmApiFunc := func(messages []Message) (<-chan string, error) {
-		return llmChat(messages, modelname, seed, temperature, nil, apiKey, apiBase, true, nil, verbose)
+		filteredMessages := make([]LLMMessage, len(messages))
+		for i, msg := range messages {
+			filteredMessages[i] = LLMMessage{
+				Role:    msg.Role,
+				Content: msg.Content,
+			}
+		}
+		return llmChat(filteredMessages, modelname, seed, temperature, nil, apiKey, apiBase, stream, extra, verbose)
 	}
 
 	llmHistoryFunc := func(msg Message) error {
@@ -533,7 +694,7 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 		messages = append(messages, *NewMessage("user", usermsg))
 	}
 
-	ch, err := llmChat(messages, modelname, seed, temperature, nil, apiKey, apiBase, stream, nil, verbose)
+	ch, err := llmApiFunc(messages)
 
 	if err != nil {
 		fmt.Println(err)

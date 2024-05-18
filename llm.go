@@ -450,6 +450,9 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	var usermsg string = ""
 
 	for _, arg := range args {
+		if len(usermsg) > 0 {
+			usermsg += " "
+		}
 		usermsg += arg
 	}
 

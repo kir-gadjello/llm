@@ -387,6 +387,7 @@ func main() {
 
 	rootCmd.Flags().StringP("model", "m", "gpt-3.5-turbo", "LLM model")
 	rootCmd.Flags().BoolP("chat", "c", false, "Launch chat mode")
+	rootCmd.Flags().BoolP("chat-send", "C", false, "Launch chat mode and send the first message right away")
 	rootCmd.Flags().StringP("prompt", "p", "", "System prompt")
 	rootCmd.Flags().IntP("seed", "s", 1337, "Random seed")
 	rootCmd.Flags().Float64P("temperature", "t", 0.0, "Temperature")
@@ -394,8 +395,8 @@ func main() {
 	rootCmd.Flags().StringP("api-base", "b", "https://api.openai.com/v1/", "OpenAI API base URL")
 	rootCmd.Flags().BoolP("stream", "S", is_terminal, "Stream output")
 	rootCmd.Flags().BoolP("verbose", "v", false, "http logging")
-	rootCmd.Flags().StringSliceP("files", "f", []string{}, "List of files and directories")
-	rootCmd.Flags().StringP("file-input-format", "i", "md", "File input format (md|xml)")
+	rootCmd.Flags().StringSliceP("files", "f", []string{}, "List of files and directories to include in context")
+	rootCmd.Flags().StringP("context-format", "i", "md", "Context (files) input template format (md|xml)")
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Println(err)
@@ -437,6 +438,7 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	stream, _ := cmd.Flags().GetBool("stream")
 	verbose, _ := cmd.Flags().GetBool("v")
 	chat, _ := cmd.Flags().GetBool("chat")
+	chat_send, _ := cmd.Flags().GetBool("chat-send")
 	systemPrompt, _ := cmd.Flags().GetString("prompt")
 
 	messages := make([]Message, 0)
@@ -505,7 +507,7 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 		return dumpToHistory(session, data)
 	}
 
-	if len(usermsg) == 0 || chat {
+	if len(usermsg) == 0 || chat || chat_send {
 
 		var initialTextareaValue = ""
 
@@ -513,7 +515,7 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 			initialTextareaValue = usermsg
 		}
 
-		p := tea.NewProgram(initialModel(*session, messages, llmHistoryFunc, llmApiFunc, initialTextareaValue), // use the full size of the terminal in its "alternate screen buffer"
+		p := tea.NewProgram(initialModel(*session, messages, llmHistoryFunc, llmApiFunc, initialTextareaValue, chat_send), // use the full size of the terminal in its "alternate screen buffer"
 			tea.WithMouseCellMotion())
 
 		if _, err := p.Run(); err != nil {
@@ -595,6 +597,7 @@ type chatTuiState struct {
 	viewportWidth  int
 	mdPaddingWidth int
 	shift          bool
+	sendRightAway  bool
 }
 
 func getLastMsg(m chatTuiState) (Message, error) {
@@ -604,7 +607,7 @@ func getLastMsg(m chatTuiState) (Message, error) {
 	return m.llmMessages[len(m.llmMessages)-1], nil
 }
 
-func initialModel(session Session, messages []Message, llmHistoryApi func(Message) error, llmApi func(messages []Message) (<-chan string, error), initialTextareaValue string) chatTuiState {
+func initialModel(session Session, messages []Message, llmHistoryApi func(Message) error, llmApi func(messages []Message) (<-chan string, error), initialTextareaValue string, sendRightAway bool) chatTuiState {
 	ta := textarea.New()
 	ta.Placeholder = "Type a message..."
 	ta.Focus()
@@ -630,6 +633,10 @@ func initialModel(session Session, messages []Message, llmHistoryApi func(Messag
 
 	sp := spinner.New()
 
+	if sendRightAway {
+
+	}
+
 	return chatTuiState{
 		spin:           false,
 		streaming:      false,
@@ -645,6 +652,7 @@ func initialModel(session Session, messages []Message, llmHistoryApi func(Messag
 		renderMarkdown: true,
 		viewportWidth:  80,
 		mdPaddingWidth: 0,
+		sendRightAway:  sendRightAway,
 	}
 }
 
@@ -747,6 +755,38 @@ func tickCmd() tea.Cmd {
 	})
 }
 
+func sendMsg(m chatTuiState, usermsg string) (tea.Model, tea.Cmd) {
+	var newmsg = *NewMessage("user", usermsg)
+
+	m.llmMessages = append(m.llmMessages, newmsg)
+	m.historyApi(newmsg)
+
+	ch, err := m.llmApi(m.llmMessages)
+
+	if err != nil {
+		log.Println(err)
+		m.err = err
+		return m, nil
+	}
+
+	m.llmMessages = append(m.llmMessages, *NewMessage("assistant", ""))
+
+	m.spin = true
+	m.spinner.Spinner = spinner.Pulse
+	m.spinner.Spinner.FPS = time.Second / 10
+	m.spinner.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("171"))
+
+	m.ch = ch
+	m.textarea.Reset()
+	m.textarea.Placeholder = TEXTINPUT_PLACEHOLDER
+	m.textarea.Focus()
+
+	m.viewport.SetContent(formatMessageLog(m.llmMessages, m.renderMarkdown, m.viewportWidth, m.mdPaddingWidth, m.spinner.View(), "", true))
+	m.viewport.GotoBottom()
+
+	return m, tea.Batch(m.spinner.Tick, readLLMResponse(m, m.ch))
+}
+
 func (m chatTuiState) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var (
 		tiCmd tea.Cmd
@@ -756,6 +796,13 @@ func (m chatTuiState) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	m.textarea, tiCmd = m.textarea.Update(msg)
 	m.viewport, vpCmd = m.viewport.Update(msg)
+
+	if m.sendRightAway {
+		m.sendRightAway = false
+		var usermsg = m.textarea.Value()
+		_m, cmds := sendMsg(m, usermsg)
+		return _m, tea.Batch(tiCmd, vpCmd, cmds)
+	}
 
 	switch msg := msg.(type) {
 
@@ -831,35 +878,9 @@ func (m chatTuiState) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 				// }
 
-				var newmsg = *NewMessage("user", usermsg)
+				ret, cmds := sendMsg(m, usermsg)
 
-				m.llmMessages = append(m.llmMessages, newmsg)
-				m.historyApi(newmsg)
-
-				ch, err := m.llmApi(m.llmMessages)
-
-				if err != nil {
-					log.Println(err)
-					m.err = err
-					return m, nil
-				}
-
-				m.llmMessages = append(m.llmMessages, *NewMessage("assistant", ""))
-
-				m.spin = true
-				m.spinner.Spinner = spinner.Pulse
-				m.spinner.Spinner.FPS = time.Second / 10
-				m.spinner.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("171"))
-
-				m.ch = ch
-				m.textarea.Reset()
-				m.textarea.Placeholder = TEXTINPUT_PLACEHOLDER
-				m.textarea.Focus()
-
-				m.viewport.SetContent(formatMessageLog(m.llmMessages, m.renderMarkdown, m.viewportWidth, m.mdPaddingWidth, m.spinner.View(), "", true))
-				m.viewport.GotoBottom()
-
-				return m, tea.Batch(tiCmd, vpCmd, spCmd, m.spinner.Tick, readLLMResponse(m, m.ch))
+				return ret, tea.Batch(tiCmd, vpCmd, spCmd, cmds)
 			}
 		}
 

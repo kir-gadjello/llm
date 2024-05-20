@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
@@ -217,13 +218,14 @@ func llmChat(
 				line = strings.TrimSpace(line)
 
 				if strings.HasPrefix(line, "data: ") {
+
 					var resp struct {
 						Choices []struct {
 							Delta struct {
 								Content string `json:"content"`
 							} `json:"delta"`
-							FinishReason string `json:"finish_reason"`
-							Index        int    `json:"index"`
+							FinishReason *string `json:"finish_reason"`
+							Index        int     `json:"index"`
 						} `json:"choices"`
 						Created int    `json:"created"`
 						ID      string `json:"id"`
@@ -243,20 +245,21 @@ func llmChat(
 						continue
 					}
 
-					// fmt.Println(resp)
-
 					if resp.Choices[0].Delta.Content != "" {
 						content := resp.Choices[0].Delta.Content
-						// fmt.Println(content)
 						if postprocess != nil {
 							content = postprocess(content)
 						}
 						ch <- content
-					} else if resp.Choices[0].FinishReason == "stop" {
-						close(ch)
-						return
 					} else {
-						fmt.Println("Unexpected end of chat completion stream:", resp)
+						if resp.Choices[0].FinishReason != nil && len(*resp.Choices[0].FinishReason) > 0 {
+							close(ch)
+							return
+						} else {
+							if verbose {
+								fmt.Println("Unexpected end of chat completion stream:", line)
+							}
+						}
 					}
 				}
 			}
@@ -448,7 +451,7 @@ func main() {
 
 	var is_terminal bool = is_interactive(os.Stdout.Fd())
 
-	rootCmd.Flags().StringP("model", "m", "gpt-3.5-turbo", "LLM model")
+	rootCmd.Flags().StringP("model", "m", "", "LLM model: OPENAI_API_MODEL,GROQ_API_MODEL,LLM_MODEL from env or gpt-3.5-turbo")
 	rootCmd.Flags().BoolP("chat", "c", false, "Launch chat mode")
 	rootCmd.Flags().BoolP("chat-send", "C", false, "Launch chat mode and send the first message right away")
 	rootCmd.Flags().StringP("prompt", "p", "", "System prompt")
@@ -515,10 +518,25 @@ func markChatStart(session *Session, userMsg, systemPrompt, model string, seed i
 	return dumpToHistory(session, data)
 }
 
+func getFirstEnv(fallback string, envVars ...string) string {
+	for _, env := range envVars {
+		v := os.Getenv(env)
+		if v != "" {
+			return v
+		}
+	}
+	return fallback
+}
+
 func runLLMChat(cmd *cobra.Command, args []string) error {
 	session := newSession()
 
 	modelname, _ := cmd.Flags().GetString("model")
+
+	if len(modelname) == 0 {
+		modelname = getFirstEnv("gpt-3.5-turbo", "OPENAI_API_MODEL", "GROQ_API_MODEL", "LLM_MODEL")
+	}
+
 	seed, _ := cmd.Flags().GetInt("seed")
 	temperature, _ := cmd.Flags().GetFloat64("temperature")
 	apiKey, _ := cmd.Flags().GetString("api-key")
@@ -715,13 +733,21 @@ func (t *loggingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	for k, v := range req.Header {
 		fmt.Printf(">>> %s: %s\n", k, v)
 	}
-	if req.Body != nil {
-		body, err := io.ReadAll(req.Body)
-		if err != nil {
-			fmt.Println(err)
-			return nil, err
-		}
-		fmt.Printf(">>> %s\n", body)
+
+	// Read and log the request body
+	reqBody, err := ioutil.ReadAll(req.Body)
+	if err != nil {
+		return nil, err
+	}
+	req.Body = ioutil.NopCloser(bytes.NewBuffer(reqBody)) // Reset req.Body
+
+	var jsonData interface{}
+	err = json.Unmarshal(reqBody, &jsonData)
+	if err == nil {
+		jsonBytes, _ := json.MarshalIndent(jsonData, "", "  ")
+		fmt.Printf(">>> %s\n", jsonBytes)
+	} else {
+		fmt.Printf(">>> %s\n", reqBody)
 	}
 
 	resp, err := http.DefaultTransport.RoundTrip(req)
@@ -733,13 +759,22 @@ func (t *loggingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	for k, v := range resp.Header {
 		fmt.Printf("<<< %s: %s\n", k, v)
 	}
-	if resp.Body != nil {
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			fmt.Println(err)
-			return nil, err
-		}
-		fmt.Printf("<<< %s\n", body)
+
+	// Read and log the response body
+	respBody, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	resp.Body = ioutil.NopCloser(bytes.NewBuffer(respBody)) // Reset resp.Body
+	defer resp.Body.Close()                                 // Close the response body
+
+	var jsonDataResp interface{}
+	err = json.Unmarshal(respBody, &jsonDataResp)
+	if err == nil {
+		jsonBytes, _ := json.MarshalIndent(jsonDataResp, "", "  ")
+		fmt.Printf("<<< %s\n", jsonBytes)
+	} else {
+		fmt.Printf("<<< %s\n", respBody)
 	}
 
 	return resp, nil

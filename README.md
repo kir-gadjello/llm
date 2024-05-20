@@ -4,7 +4,7 @@
 
 A cli tool to make local and remote LLMs useful in the shell (bonus: streaming & interactivity supported) 
 
-Only OpenAI-compatible endpoints are supported and detected via environment variable `OPENAI_API_BASE`. llama.cpp server and tabbyAPI are supported and tested. 
+Only OpenAI-compatible endpoints are supported and detected via environment variable `OPENAI_API_BASE`. llama.cpp server, tabbyAPI and Groq API are supported and tested. 
 
 The tool is suitable for basic usage as is and I retain the right to add various useful features in the future.
 

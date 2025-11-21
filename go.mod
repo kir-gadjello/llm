@@ -13,6 +13,7 @@ require github.com/charmbracelet/bubbles v0.18.0
 require (
 	github.com/charmbracelet/lipgloss v0.9.1
 	github.com/vlanse/go-term-markdown v0.0.1-dev2
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
@@ -28,7 +29,6 @@ require (
 	github.com/gomarkdown/markdown v0.0.0-20231222211730-1d6d20845b47 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/kyokomi/emoji/v2 v2.2.12 // indirect
-	github.com/lrstanley/bubblezone v0.0.0-20240125042004-b7bafc493195 // indirect
 	github.com/lucasb-eyer/go-colorful v1.2.0 // indirect
 	github.com/mattn/go-colorable v0.1.13 // indirect
 	github.com/mattn/go-localereader v0.0.1 // indirect

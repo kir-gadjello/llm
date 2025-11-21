@@ -1,5 +1,26 @@
 # llm
 
+## Configuration
+
+Optional `~/.llmterm.yaml`:
+
+```yaml
+default: gpt-4o-mini
+
+models:
+  gpt-4o-mini:
+    api_base: https://api.openai.com/v1
+    temperature: 0.1
+  groq-llama3:
+    model: llama3-8b-8192
+    api_base: https://api.groq.com/openai/v1
+  local-llama:
+    model: llama-3-8b-Instruct-q6
+    api_base: http://localhost:8080/v1
+```
+
+CLI flags override config. Use `-m <profile>` or default.
+
 ## Synopsis
 
 A cli tool to make local and remote LLMs useful in the shell (bonus: streaming & interactivity supported) 

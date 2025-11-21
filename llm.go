@@ -31,6 +31,8 @@ import (
 	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
 	markdown "github.com/vlanse/go-term-markdown"
+
+	"gopkg.in/yaml.v3"
 )
 
 var TEXTINPUT_PLACEHOLDER = "Type a message and press Enter to send..."
@@ -357,6 +359,146 @@ func getModelList(apiKey string, apiBase string, timeout time.Duration) ([]Model
 	return modelList.Data, nil
 }
 
+type ModelConfig struct {
+	Model            *string                `yaml:"model,omitempty"`
+	ApiBase          *string                `yaml:"api_base,omitempty"`
+	ApiKey           *string                `yaml:"api_key,omitempty"`
+	Temperature      *float64               `yaml:"temperature,omitempty"`
+	Seed             *int                   `yaml:"seed,omitempty"`
+	MaxTokens        *int                   `yaml:"max_tokens,omitempty"`
+	TopP             *float64               `yaml:"top_p,omitempty"`
+	FrequencyPenalty *float64               `yaml:"frequency_penalty,omitempty"`
+	PresencePenalty  *float64               `yaml:"presence_penalty,omitempty"`
+	ExtraBody        map[string]interface{} `yaml:"extra_body,omitempty"`
+	Extend           *string                `yaml:"extend,omitempty"`
+}
+
+type ConfigFile struct {
+	Default string                 `yaml:"default,omitempty"`
+	Models  map[string]ModelConfig `yaml:"models,omitempty"`
+}
+
+func loadConfig() (*ConfigFile, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+	configPath := filepath.Join(home, ".llmterm.yaml")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return &ConfigFile{}, nil
+		}
+		return nil, err
+	}
+	var cfg ConfigFile
+	err = yaml.Unmarshal(data, &cfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse %s: %w", configPath, err)
+	}
+	return &cfg, nil
+}
+
+func mergeMaps(base, override map[string]interface{}) map[string]interface{} {
+	if base == nil {
+		base = make(map[string]interface{})
+	}
+	if override == nil {
+		return base
+	}
+
+	result := make(map[string]interface{})
+	for k, v := range base {
+		result[k] = v
+	}
+
+	for k, v := range override {
+		if baseVal, ok := result[k]; ok {
+			// If both are maps, recurse
+			baseMap, baseOk := baseVal.(map[string]interface{})
+			overrideMap, overrideOk := v.(map[string]interface{})
+			if baseOk && overrideOk {
+				result[k] = mergeMaps(baseMap, overrideMap)
+				continue
+			}
+		}
+		// Otherwise overwrite
+		result[k] = v
+	}
+	return result
+}
+
+func resolveModelConfig(cfg *ConfigFile, modelName string) (ModelConfig, error) {
+	// Basic cycle detection could be added here if needed, but for now we'll trust the user
+	// or hit a stack overflow if they make a loop.
+	// To be safer, we can use a visited map.
+	return resolveModelConfigRec(cfg, modelName, map[string]bool{})
+}
+
+func resolveModelConfigRec(cfg *ConfigFile, modelName string, visited map[string]bool) (ModelConfig, error) {
+	if visited[modelName] {
+		return ModelConfig{}, fmt.Errorf("circular dependency detected for model: %s", modelName)
+	}
+	visited[modelName] = true
+
+	modelCfg, ok := cfg.Models[modelName]
+	if !ok {
+		// If the model doesn't exist in config, we return an empty config
+		// This allows using models that are not explicitly defined but might be defaults
+		return ModelConfig{}, nil
+	}
+
+	if modelCfg.Extend != nil {
+		parentName := *modelCfg.Extend
+		parentCfg, err := resolveModelConfigRec(cfg, parentName, visited)
+		if err != nil {
+			return ModelConfig{}, err
+		}
+
+		// Merge parent into child (child overrides parent)
+		merged := parentCfg // Start with parent
+
+		if modelCfg.Model != nil {
+			merged.Model = modelCfg.Model
+		}
+		if modelCfg.ApiBase != nil {
+			merged.ApiBase = modelCfg.ApiBase
+		}
+		if modelCfg.ApiKey != nil {
+			merged.ApiKey = modelCfg.ApiKey
+		}
+		if modelCfg.Temperature != nil {
+			merged.Temperature = modelCfg.Temperature
+		}
+		if modelCfg.Seed != nil {
+			merged.Seed = modelCfg.Seed
+		}
+		if modelCfg.MaxTokens != nil {
+			merged.MaxTokens = modelCfg.MaxTokens
+		}
+		if modelCfg.TopP != nil {
+			merged.TopP = modelCfg.TopP
+		}
+		if modelCfg.FrequencyPenalty != nil {
+			merged.FrequencyPenalty = modelCfg.FrequencyPenalty
+		}
+		if modelCfg.PresencePenalty != nil {
+			merged.PresencePenalty = modelCfg.PresencePenalty
+		}
+
+		merged.ExtraBody = mergeMaps(merged.ExtraBody, modelCfg.ExtraBody)
+
+		// Extend is handled by the recursion, so we don't need to copy it,
+		// but for correctness of the struct state, we can leave it or clear it.
+		// Let's keep the child's extend value.
+		merged.Extend = modelCfg.Extend
+
+		return merged, nil
+	}
+
+	return modelCfg, nil
+}
+
 func putTextIntoClipboard(text string) error {
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
@@ -410,7 +552,7 @@ func generateUUID() string {
 	u := make([]byte, 16)
 	_, err := rand.Read(u)
 	if err != nil {
-		return fmt.Sprintf("%s", time.Now().UnixMilli())
+		return fmt.Sprintf("%d", time.Now().UnixMilli())
 	}
 	return base64.URLEncoding.EncodeToString(u)
 }
@@ -533,8 +675,18 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 
 	modelname, _ := cmd.Flags().GetString("model")
 
+	cfg, err := loadConfig()
+	if err != nil {
+		log.Printf("Warning: failed to load config: %v", err)
+		cfg = &ConfigFile{}
+	}
+
 	if len(modelname) == 0 {
-		modelname = getFirstEnv("gpt-3.5-turbo", "OPENAI_API_MODEL", "GROQ_API_MODEL", "LLM_MODEL")
+		if cfg.Default != "" {
+			modelname = cfg.Default
+		} else {
+			modelname = getFirstEnv("gpt-3.5-turbo", "OPENAI_API_MODEL", "GROQ_API_MODEL", "LLM_MODEL")
+		}
 	}
 
 	seed, _ := cmd.Flags().GetInt("seed")
@@ -554,6 +706,55 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	topP, _ := cmd.Flags().GetFloat64("top_p")
 	apiParams, _ := cmd.Flags().GetString("api-params")
 	jsonSchema, _ := cmd.Flags().GetString("json-schema")
+
+	var configExtraBody map[string]interface{}
+
+	// Apply config profile overrides if modelname matches a profile and flag not explicitly set
+	if len(modelname) > 0 {
+		resolvedCfg, err := resolveModelConfig(cfg, modelname)
+		if err != nil {
+			log.Printf("Warning: failed to resolve config for model %s: %v", modelname, err)
+		} else {
+			if resolvedCfg.Model != nil {
+				modelname = *resolvedCfg.Model
+			}
+			if resolvedCfg.ApiKey != nil && !cmd.Flags().Changed("api-key") {
+				apiKey = *resolvedCfg.ApiKey
+			}
+			if resolvedCfg.ApiBase != nil && !cmd.Flags().Changed("api-base") {
+				apiBase = *resolvedCfg.ApiBase
+			}
+			if resolvedCfg.Temperature != nil && !cmd.Flags().Changed("temperature") {
+				temperature = *resolvedCfg.Temperature
+			}
+			if resolvedCfg.Seed != nil && !cmd.Flags().Changed("seed") {
+				seed = *resolvedCfg.Seed
+			}
+			if resolvedCfg.MaxTokens != nil && !cmd.Flags().Changed("max_tokens") {
+				maxTokens = *resolvedCfg.MaxTokens
+			}
+			if resolvedCfg.TopP != nil && !cmd.Flags().Changed("top_p") {
+				topP = *resolvedCfg.TopP
+			}
+			if resolvedCfg.FrequencyPenalty != nil && !cmd.Flags().Changed("frequency_penalty") {
+				frequencyPenalty = *resolvedCfg.FrequencyPenalty
+			}
+			if resolvedCfg.PresencePenalty != nil && !cmd.Flags().Changed("presence_penalty") {
+				presencePenalty = *resolvedCfg.PresencePenalty
+			}
+
+			// Merge ExtraBody into apiParams if not already present
+			// apiParams from CLI takes precedence, but here we are just preparing the extra map
+			// We will merge it later
+			if resolvedCfg.ExtraBody != nil {
+				// We'll handle this merge when constructing the 'extra' map
+				// For now, let's store it in a temporary variable or merge it into apiParamsMap if possible
+				// But apiParamsMap is parsed from CLI string.
+				// Let's add a variable to hold config extra body
+				configExtraBody = resolvedCfg.ExtraBody
+			}
+		}
+	}
 
 	stopSequences, _ := cmd.Flags().GetString("stop")
 	var stopSeqInterface interface{}
@@ -599,7 +800,7 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	apiKey, apiBase, err := resolveLLMApi(apiKey, apiBase)
+	apiKey, apiBase, err = resolveLLMApi(apiKey, apiBase)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -658,6 +859,11 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 		extra["response_format"] = map[string]interface{}{"type": "json_object"}
 	}
 
+	for k, v := range configExtraBody {
+		extra[k] = v
+	}
+
+	// CLI params override config
 	for k, v := range apiParamsMap {
 		extra[k] = v
 	}
@@ -920,7 +1126,7 @@ func formatMessageLog(msgs []Message, renderMarkdown bool, lineWidth int,
 		}
 
 		if renderMarkdown {
-			key := fmt.Sprintf("%s__%s__%s", content, lineWidth, mdPadding)
+			key := fmt.Sprintf("%s__%d__%d", content, lineWidth, mdPadding)
 			markdownCache.Lock()
 			if cachedContent, ok := markdownCache.cache[key]; ok {
 				markdownCache.Unlock()

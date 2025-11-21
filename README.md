@@ -1,8 +1,48 @@
 # llm
 
+A CLI tool for using local and remote LLMs directly from the shell, with streaming, interactivity, and OpenRouter-style reasoning token support.
+
+```bash
+go install github.com/kir-gadjello/llm@latest
+```
+
+## Usage
+
+```bash
+llm "your message"
+llm -p "system prompt" "user message"
+echo "data" | llm "analyze this"
+llm -c  # interactive chat
+```
+
+### Reasoning Models
+
+Control reasoning token generation for models that support it (OpenAI o-series, Grok, etc.):
+
+```bash
+llm -m o1 --reasoning-high "explain quantum entanglement"
+llm -m grok-2 -n "simple task"  # disable reasoning
+llm -R2048 "complex analysis"   # specific token budget
+```
+
+### Clipboard Integration
+
+```bash
+pbcopy < file.txt && llm -x "review this"
+llm -x --context-order append "context after prompt"
+```
+
+### Constrained Generation
+
+JSON schema support for llama.cpp and compatible backends:
+
+```bash
+llm -J '{"type": "string", "enum": ["yes", "no"]}' "is pi > e"
+```
+
 ## Configuration
 
-Optional `~/.llmterm.yaml`:
+Create `~/.llmterm.yaml` for model profiles:
 
 ```yaml
 default: gpt-4o-mini
@@ -11,30 +51,34 @@ models:
   gpt-4o-mini:
     api_base: https://api.openai.com/v1
     temperature: 0.1
+    
+  o1-reasoning:
+    model: o1
+    api_base: https://openrouter.ai/api/v1
+    reasoning_effort: high
+    reasoning_exclude: false
+    
   groq-llama3:
     model: llama3-8b-8192
     api_base: https://api.groq.com/openai/v1
+    
   local-llama:
     model: llama-3-8b-Instruct-q6
     api_base: http://localhost:8080/v1
 ```
 
-CLI flags override config. Use `-m <profile>` or default.
+Use with `-m <profile>`. CLI flags override config values.
 
-## Synopsis
+**Reasoning parameters:**
+- `reasoning_effort`: none, low, medium, high
+- `reasoning_max_tokens`: integer token budget
+- `reasoning_exclude`: exclude reasoning from response
+- `context_order`: prepend, append (for clipboard)
 
-A cli tool to make local and remote LLMs useful in the shell (bonus: streaming & interactivity supported) 
+## Compatibility
 
-Only OpenAI-compatible endpoints are supported and detected via environment variable `OPENAI_API_BASE`. llama.cpp server, tabbyAPI and Groq API are supported and tested. 
-
-The tool is suitable for basic usage as is and I retain the right to add various useful features in the future.
-
-Install: `go install github.com/kir-gadjello/llm@latest`
-
-## Examples
-
-`llm <your user message>` \
-`llm -p=<your system prompt> <your user message>` \
-`some-program | llm <your user message>` - stdin pipe, also compatible with user prompts and system prompts \
-`llm`, `llm -c` - interactive chat \
-`llm -p='You are an intelligent AI assistant answering ONLY "yes" or "no" to all user questions and queries' -J '{"$schema": "http://json-schema.org/draft-07/schema#", "type": "string", "enum": ["yes", "no"]}' is pi larger than e` - json schema constrained generation (llama.cpp)
+OpenAI-compatible endpoints only. Tested and working with:
+- llama.cpp server
+- tabbyAPI
+- Groq API
+- OpenRouter (with reasoning token support)

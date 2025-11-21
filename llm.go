@@ -360,17 +360,18 @@ func getModelList(apiKey string, apiBase string, timeout time.Duration) ([]Model
 }
 
 type ModelConfig struct {
-	Model            *string                `yaml:"model,omitempty"`
-	ApiBase          *string                `yaml:"api_base,omitempty"`
-	ApiKey           *string                `yaml:"api_key,omitempty"`
-	Temperature      *float64               `yaml:"temperature,omitempty"`
-	Seed             *int                   `yaml:"seed,omitempty"`
-	MaxTokens        *int                   `yaml:"max_tokens,omitempty"`
-	TopP             *float64               `yaml:"top_p,omitempty"`
-	FrequencyPenalty *float64               `yaml:"frequency_penalty,omitempty"`
-	PresencePenalty  *float64               `yaml:"presence_penalty,omitempty"`
-	ExtraBody        map[string]interface{} `yaml:"extra_body,omitempty"`
-	Extend           *string                `yaml:"extend,omitempty"`
+	Model              *string                `yaml:"model,omitempty"`
+	ApiBase            *string                `yaml:"api_base,omitempty"`
+	ApiKey             *string                `yaml:"api_key,omitempty"`
+	Temperature        *float64               `yaml:"temperature,omitempty"`
+	Seed               *int                   `yaml:"seed,omitempty"`
+	MaxTokens          *int                   `yaml:"max_tokens,omitempty"`
+	ReasoningEffort    *string                `yaml:"reasoning_effort,omitempty"`
+	ReasoningMaxTokens *int                   `yaml:"reasoning_max_tokens,omitempty"`
+	ReasoningExclude   *bool                  `yaml:"reasoning_exclude,omitempty"`
+	ContextOrder       *string                `yaml:"context_order,omitempty"`
+	ExtraBody          map[string]interface{} `yaml:"extra_body,omitempty"`
+	Extend             *string                `yaml:"extend,omitempty"`
 }
 
 type ConfigFile struct {
@@ -476,14 +477,17 @@ func resolveModelConfigRec(cfg *ConfigFile, modelName string, visited map[string
 		if modelCfg.MaxTokens != nil {
 			merged.MaxTokens = modelCfg.MaxTokens
 		}
-		if modelCfg.TopP != nil {
-			merged.TopP = modelCfg.TopP
+		if modelCfg.ReasoningEffort != nil {
+			merged.ReasoningEffort = modelCfg.ReasoningEffort
 		}
-		if modelCfg.FrequencyPenalty != nil {
-			merged.FrequencyPenalty = modelCfg.FrequencyPenalty
+		if modelCfg.ReasoningMaxTokens != nil {
+			merged.ReasoningMaxTokens = modelCfg.ReasoningMaxTokens
 		}
-		if modelCfg.PresencePenalty != nil {
-			merged.PresencePenalty = modelCfg.PresencePenalty
+		if modelCfg.ReasoningExclude != nil {
+			merged.ReasoningExclude = modelCfg.ReasoningExclude
+		}
+		if modelCfg.ContextOrder != nil {
+			merged.ContextOrder = modelCfg.ContextOrder
 		}
 
 		merged.ExtraBody = mergeMaps(merged.ExtraBody, modelCfg.ExtraBody)
@@ -594,26 +598,44 @@ func main() {
 	var is_terminal bool = is_interactive(os.Stdout.Fd())
 
 	rootCmd.Flags().StringP("model", "m", "", "LLM model: OPENAI_API_MODEL,GROQ_API_MODEL,LLM_MODEL from env or gpt-3.5-turbo")
-	rootCmd.Flags().BoolP("chat", "c", false, "Launch chat mode")
-	rootCmd.Flags().BoolP("chat-send", "C", false, "Launch chat mode and send the first message right away")
 	rootCmd.Flags().StringP("prompt", "p", "", "System prompt")
-	rootCmd.Flags().IntP("seed", "s", 1337, "Random seed")
 	rootCmd.Flags().Float64P("temperature", "t", 0.0, "Temperature")
+	rootCmd.Flags().IntP("seed", "s", 1337, "Random seed")
 	rootCmd.Flags().IntP("max_tokens", "N", 4096, "Max amount of tokens in response")
-	rootCmd.Flags().Float64P("frequency_penalty", "Q", 0.0, "Frequency penalty between -2.0 and 2.0")
-	rootCmd.Flags().Float64P("presence_penalty", "Y", 0.0, "Presence penalty between -2.0 and 2.0")
+	rootCmd.Flags().BoolP("stream", "S", is_terminal, "Stream output")
+
+	// Reasoning controls (OpenRouter-style)
+	rootCmd.Flags().BoolP("no-reasoning", "n", false, "Disable reasoning entirely")
+	rootCmd.Flags().Bool("reasoning-low", false, "Reasoning effort: low/minimal (~10-20% tokens)")
+	rootCmd.Flags().Bool("reasoning-medium", false, "Reasoning effort: medium (~50%)")
+	rootCmd.Flags().Bool("reasoning-high", false, "Reasoning effort: high (~80%)")
+	rootCmd.Flags().IntP("reasoning-max", "R", 0, "Reasoning max_tokens (e.g., -R2048)")
+	rootCmd.Flags().Bool("reasoning-exclude", false, "Use reasoning but exclude from response")
+	// Aliases
+	rootCmd.Flags().SetAnnotation("reasoning-low", cobra.BashCompOneRequiredFlag, []string{"false"})
+	rootCmd.Flags().SetAnnotation("reasoning-medium", cobra.BashCompOneRequiredFlag, []string{"false"})
+	rootCmd.Flags().SetAnnotation("reasoning-high", cobra.BashCompOneRequiredFlag, []string{"false"})
+
+	// Chat/IO
+	rootCmd.Flags().BoolP("chat", "c", false, "Launch chat mode")
+	rootCmd.Flags().Bool("chat-send", false, "Launch chat mode and send the first message right away")
+	rootCmd.Flags().BoolP("clipboard", "x", false, "Paste clipboard content as <user-clipboard-content>")
+	rootCmd.Flags().String("context-order", "prepend", "Context ordering for clipboard: prepend|append")
+	rootCmd.Flags().StringSliceP("files", "f", []string{}, "List of files and directories to include in context")
+	rootCmd.Flags().StringP("context-format", "i", "md", "Context (files) input template format (md|xml)")
+
+	// API/Debug
+	rootCmd.Flags().StringP("api-key", "k", "", "OpenAI API key")
+	rootCmd.Flags().StringP("api-base", "b", "https://api.openai.com/v1/", "OpenAI API base URL")
+	rootCmd.Flags().StringP("extra", "e", "{}", "Additional LLM API parameters expressed as json, take precedence over provided CLI arguments")
 	rootCmd.Flags().BoolP("json", "j", false, "json mode")
 	rootCmd.Flags().StringP("json-schema", "J", "", "json schema (compatible with llama.cpp and tabbyAPI, not compatible with OpenAI)")
 	rootCmd.Flags().StringP("stop", "X", "", "Stop sequences (a single word or a json array)")
-	rootCmd.Flags().Float64P("top_p", "", 1.0, "Top-P sampling setting, defaults to 1.0")
-	rootCmd.Flags().StringP("api-params", "A", "{}", "Additional LLM API parameters expressed as json, take precedence over provided CLI arguments")
-	rootCmd.Flags().StringP("api-key", "k", "", "OpenAI API key")
-	rootCmd.Flags().StringP("api-base", "b", "https://api.openai.com/v1/", "OpenAI API base URL")
-	rootCmd.Flags().BoolP("stream", "S", is_terminal, "Stream output")
-	rootCmd.Flags().BoolP("verbose", "v", false, "http & debug logging")
-	rootCmd.Flags().StringSliceP("files", "f", []string{}, "List of files and directories to include in context")
-	rootCmd.Flags().StringP("context-format", "i", "md", "Context (files) input template format (md|xml)")
 	rootCmd.Flags().BoolP("debug", "D", false, "Output prompt & system msg")
+	rootCmd.Flags().BoolP("verbose", "v", false, "http & debug logging")
+
+	// Legacy short flags for backward compatibility
+	rootCmd.Flags().Lookup("chat-send").ShorthandDeprecated = "use --chat-send instead"
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Println(err)
@@ -621,41 +643,41 @@ func main() {
 	}
 }
 
-func markChatStart(session *Session, userMsg, systemPrompt, model string, seed int, temperature float64, apiBase string, maxTokens int, frequencyPenalty, presencePenalty float64, jsonMode bool, stopSequences interface{}, topP float64, apiParams string, jsonSchema string) error {
+func markChatStart(session *Session, userMsg, systemPrompt, model string, seed int, temperature float64, apiBase string, maxTokens int, jsonMode bool, stopSequences interface{}, extraParams string, jsonSchema string, reasoningEffort string, reasoningMaxTokens int, reasoningExclude bool) error {
 	data := struct {
-		SID              string      `json:"sid"`
-		TS               int         `json:"ts"`
-		UserMsg          string      `json:"user_msg"`
-		SystemPrompt     string      `json:"system_prompt"`
-		Model            string      `json:"model"`
-		Seed             int         `json:"seed"`
-		Temperature      float64     `json:"temperature"`
-		APIBase          string      `json:"api_base"`
-		MaxTokens        int         `json:"max_tokens"`
-		FrequencyPenalty float64     `json:"frequency_penalty"`
-		PresencePenalty  float64     `json:"presence_penalty"`
-		JSONMode         bool        `json:"json_mode"`
-		StopSequences    interface{} `json:"stop_sequences"`
-		TopP             float64     `json:"top_p"`
-		APIParams        string      `json:"api_params"`
-		JsonSchema       string      `json:"api_params"`
+		SID                string      `json:"sid"`
+		TS                 int         `json:"ts"`
+		UserMsg            string      `json:"user_msg"`
+		SystemPrompt       string      `json:"system_prompt"`
+		Model              string      `json:"model"`
+		Seed               int         `json:"seed"`
+		Temperature        float64     `json:"temperature"`
+		APIBase            string      `json:"api_base"`
+		MaxTokens          int         `json:"max_tokens"`
+		JSONMode           bool        `json:"json_mode"`
+		StopSequences      interface{} `json:"stop_sequences"`
+		ExtraParams        string      `json:"extra_params"`
+		JsonSchema         string      `json:"json_schema"`
+		ReasoningEffort    string      `json:"reasoning_effort,omitempty"`
+		ReasoningMaxTokens int         `json:"reasoning_max_tokens,omitempty"`
+		ReasoningExclude   bool        `json:"reasoning_exclude,omitempty"`
 	}{
-		SID:              session.UUID,
-		TS:               int(time.Now().Unix()),
-		UserMsg:          userMsg,
-		SystemPrompt:     systemPrompt,
-		Model:            model,
-		Seed:             seed,
-		Temperature:      temperature,
-		APIBase:          apiBase,
-		MaxTokens:        maxTokens,
-		FrequencyPenalty: frequencyPenalty,
-		PresencePenalty:  presencePenalty,
-		JSONMode:         jsonMode,
-		StopSequences:    stopSequences,
-		TopP:             topP,
-		APIParams:        apiParams,
-		JsonSchema:       jsonSchema,
+		SID:                session.UUID,
+		TS:                 int(time.Now().Unix()),
+		UserMsg:            userMsg,
+		SystemPrompt:       systemPrompt,
+		Model:              model,
+		Seed:               seed,
+		Temperature:        temperature,
+		APIBase:            apiBase,
+		MaxTokens:          maxTokens,
+		JSONMode:           jsonMode,
+		StopSequences:      stopSequences,
+		ExtraParams:        extraParams,
+		JsonSchema:         jsonSchema,
+		ReasoningEffort:    reasoningEffort,
+		ReasoningMaxTokens: reasoningMaxTokens,
+		ReasoningExclude:   reasoningExclude,
 	}
 	return dumpToHistory(session, data)
 }
@@ -700,12 +722,21 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	systemPrompt, _ := cmd.Flags().GetString("prompt")
 	debug, _ := cmd.Flags().GetBool("debug")
 	maxTokens, _ := cmd.Flags().GetInt("max_tokens")
-	frequencyPenalty, _ := cmd.Flags().GetFloat64("frequency_penalty")
-	presencePenalty, _ := cmd.Flags().GetFloat64("presence_penalty")
 	jsonMode, _ := cmd.Flags().GetBool("json")
-	topP, _ := cmd.Flags().GetFloat64("top_p")
-	apiParams, _ := cmd.Flags().GetString("api-params")
+	extraParams, _ := cmd.Flags().GetString("extra")
 	jsonSchema, _ := cmd.Flags().GetString("json-schema")
+
+	// Reasoning flags
+	noReasoning, _ := cmd.Flags().GetBool("no-reasoning")
+	reasoningLow, _ := cmd.Flags().GetBool("reasoning-low")
+	reasoningMedium, _ := cmd.Flags().GetBool("reasoning-medium")
+	reasoningHigh, _ := cmd.Flags().GetBool("reasoning-high")
+	reasoningMax, _ := cmd.Flags().GetInt("reasoning-max")
+	reasoningExclude, _ := cmd.Flags().GetBool("reasoning-exclude")
+
+	// Clipboard flags
+	useClipboard, _ := cmd.Flags().GetBool("clipboard")
+	contextOrder, _ := cmd.Flags().GetString("context-order")
 
 	var configExtraBody map[string]interface{}
 
@@ -733,14 +764,28 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 			if resolvedCfg.MaxTokens != nil && !cmd.Flags().Changed("max_tokens") {
 				maxTokens = *resolvedCfg.MaxTokens
 			}
-			if resolvedCfg.TopP != nil && !cmd.Flags().Changed("top_p") {
-				topP = *resolvedCfg.TopP
+			// Apply reasoning config if not specified via flags
+			if resolvedCfg.ReasoningEffort != nil && !cmd.Flags().Changed("no-reasoning") && !cmd.Flags().Changed("reasoning-low") && !cmd.Flags().Changed("reasoning-medium") && !cmd.Flags().Changed("reasoning-high") {
+				// Apply the configured reasoning effort
+				switch *resolvedCfg.ReasoningEffort {
+				case "none":
+					noReasoning = true
+				case "low", "minimal":
+					reasoningLow = true
+				case "medium":
+					reasoningMedium = true
+				case "high":
+					reasoningHigh = true
+				}
 			}
-			if resolvedCfg.FrequencyPenalty != nil && !cmd.Flags().Changed("frequency_penalty") {
-				frequencyPenalty = *resolvedCfg.FrequencyPenalty
+			if resolvedCfg.ReasoningMaxTokens != nil && !cmd.Flags().Changed("reasoning-max") {
+				reasoningMax = *resolvedCfg.ReasoningMaxTokens
 			}
-			if resolvedCfg.PresencePenalty != nil && !cmd.Flags().Changed("presence_penalty") {
-				presencePenalty = *resolvedCfg.PresencePenalty
+			if resolvedCfg.ReasoningExclude != nil && !cmd.Flags().Changed("reasoning-exclude") {
+				reasoningExclude = *resolvedCfg.ReasoningExclude
+			}
+			if resolvedCfg.ContextOrder != nil && !cmd.Flags().Changed("context-order") {
+				contextOrder = *resolvedCfg.ContextOrder
 			}
 
 			// Merge ExtraBody into apiParams if not already present
@@ -800,6 +845,34 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Handle clipboard if requested
+	if useClipboard {
+		clipboardCmd := exec.Command("pbpaste")
+		clipboardOutput, err := clipboardCmd.Output()
+		if err != nil {
+			log.Printf("Warning: failed to read clipboard: %v", err)
+		} else {
+			clipboardContent := string(clipboardOutput)
+			if len(clipboardContent) > 0 {
+				wrappedClipboard := "<user-clipboard-content>\n" + clipboardContent + "\n</user-clipboard-content>"
+
+				// Apply context ordering
+				if contextOrder == "append" {
+					if len(usermsg) > 0 {
+						usermsg += "\n\n"
+					}
+					usermsg += wrappedClipboard
+				} else { // Default is prepend
+					if len(usermsg) > 0 {
+						usermsg = wrappedClipboard + "\n\n" + usermsg
+					} else {
+						usermsg = wrappedClipboard
+					}
+				}
+			}
+		}
+	}
+
 	apiKey, apiBase, err = resolveLLMApi(apiKey, apiBase)
 	if err != nil {
 		log.Fatal(err)
@@ -816,25 +889,78 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Determine reasoning configuration with mutual exclusivity handling
+	var reasoningEffort string
+	var reasoningConfiguredMax int
+	var reasoningConfiguredExclude bool
+	reasoningFlagCount := 0
+
+	if noReasoning {
+		reasoningEffort = "none"
+		reasoningFlagCount++
+	}
+	if reasoningLow {
+		reasoningEffort = "low"
+		reasoningFlagCount++
+	}
+	if reasoningMedium {
+		reasoningEffort = "medium"
+		reasoningFlagCount++
+	}
+	if reasoningHigh {
+		reasoningEffort = "high"
+		reasoningFlagCount++
+	}
+	if reasoningMax > 0 {
+		reasoningConfiguredMax = reasoningMax
+		reasoningFlagCount++
+	}
+
+	// Warn if multiple reasoning flags were specified
+	if reasoningFlagCount > 1 {
+		fmt.Fprintf(os.Stderr, "Warning: Multiple reasoning flags specified, using last-specified option\n")
+	}
+
+	reasoningConfiguredExclude = reasoningExclude
+
 	if debug {
 		fmt.Printf("PROMPT: \"%s\"\nSYSTEM MESSAGE: \"%s\"", usermsg, systemPrompt)
 		return nil
 	}
 
-	markChatStart(session, usermsg, systemPrompt, modelname, seed, temperature, apiBase, maxTokens, frequencyPenalty, presencePenalty, jsonMode, stopSeqInterface, topP, apiParams, jsonSchema)
+	markChatStart(session, usermsg, systemPrompt, modelname, seed, temperature, apiBase, maxTokens, jsonMode, stopSeqInterface, extraParams, jsonSchema, reasoningEffort, reasoningConfiguredMax, reasoningConfiguredExclude)
 
 	var extra map[string]interface{}
 
-	apiParamsMap := map[string]interface{}{}
-	if err := json.Unmarshal([]byte(apiParams), &apiParamsMap); err != nil {
+	extraParamsMap := map[string]interface{}{}
+	if err := json.Unmarshal([]byte(extraParams), &extraParamsMap); err != nil {
 		log.Fatal(err)
 	}
 
 	extra = map[string]interface{}{
-		"max_tokens":        maxTokens,
-		"frequency_penalty": frequencyPenalty,
-		"presence_penalty":  presencePenalty,
-		"top_p":             topP,
+		"max_tokens": maxTokens,
+	}
+
+	// Build reasoning object if any reasoning flags are set
+	var reasoningObj map[string]interface{}
+	if reasoningEffort != "" {
+		reasoningObj = map[string]interface{}{
+			"effort": reasoningEffort,
+		}
+	} else if reasoningConfiguredMax > 0 {
+		reasoningObj = map[string]interface{}{
+			"max_tokens": reasoningConfiguredMax,
+		}
+	}
+
+	// Add exclude flag if set and we have a reasoning object
+	if reasoningConfiguredExclude && reasoningObj != nil {
+		reasoningObj["exclude"] = true
+	}
+
+	// Add reasoning to extra if configured
+	if reasoningObj != nil {
+		extra["reasoning"] = reasoningObj
 	}
 
 	switch v := stopSeqInterface.(type) {
@@ -864,7 +990,7 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	}
 
 	// CLI params override config
-	for k, v := range apiParamsMap {
+	for k, v := range extraParamsMap {
 		extra[k] = v
 	}
 

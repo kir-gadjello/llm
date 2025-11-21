@@ -375,8 +375,9 @@ type ModelConfig struct {
 }
 
 type ConfigFile struct {
-	Default string                 `yaml:"default,omitempty"`
-	Models  map[string]ModelConfig `yaml:"models,omitempty"`
+	Default           string                 `yaml:"default,omitempty"`
+	PipedInputWrapper *string                `yaml:"piped_input_wrapper,omitempty"`
+	Models            map[string]ModelConfig `yaml:"models,omitempty"`
 }
 
 func loadConfig() (*ConfigFile, error) {
@@ -621,6 +622,7 @@ func main() {
 	rootCmd.Flags().Bool("chat-send", false, "Launch chat mode and send the first message right away")
 	rootCmd.Flags().BoolP("clipboard", "x", false, "Paste clipboard content as <user-clipboard-content>")
 	rootCmd.Flags().String("context-order", "prepend", "Context ordering for clipboard: prepend|append")
+	rootCmd.Flags().StringP("piped-wrapper", "w", "context", "Wrapper tag for piped stdin (empty string disables wrapping)")
 	rootCmd.Flags().StringSliceP("files", "f", []string{}, "List of files and directories to include in context")
 	rootCmd.Flags().StringP("context-format", "i", "md", "Context (files) input template format (md|xml)")
 
@@ -737,6 +739,7 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	// Clipboard flags
 	useClipboard, _ := cmd.Flags().GetBool("clipboard")
 	contextOrder, _ := cmd.Flags().GetString("context-order")
+	pipedWrapper, _ := cmd.Flags().GetString("piped-wrapper")
 
 	var configExtraBody map[string]interface{}
 
@@ -801,6 +804,11 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Apply top-level piped_input_wrapper from config if flag not explicitly set
+	if cfg.PipedInputWrapper != nil && !cmd.Flags().Changed("piped-wrapper") {
+		pipedWrapper = *cfg.PipedInputWrapper
+	}
+
 	stopSequences, _ := cmd.Flags().GetString("stop")
 	var stopSeqInterface interface{}
 	if strings.HasPrefix(stopSequences, "[") && strings.HasSuffix(stopSequences, "]") {
@@ -831,17 +839,29 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 
 	// Read from stdin if available
 	stat, _ := os.Stdin.Stat()
-	var first = false
 	if (stat.Mode() & os.ModeCharDevice) == 0 {
 		// stdin is a pipe or a file, read from it
+		var pipedContent strings.Builder
 		scanner := bufio.NewScanner(os.Stdin)
 		for scanner.Scan() {
-			if first {
-				usermsg += " "
-				first = false
+			pipedContent.WriteString(scanner.Text())
+			pipedContent.WriteString("\n")
+		}
+
+		if pipedContent.Len() > 0 {
+			content := strings.TrimRight(pipedContent.String(), "\n")
+
+			// Wrap with tags if wrapper is not empty
+			if pipedWrapper != "" {
+				content = "<" + pipedWrapper + ">\n" + content + "\n</" + pipedWrapper + ">"
 			}
-			usermsg += scanner.Text()
-			usermsg += " "
+
+			// Prepend piped content to user message
+			if len(usermsg) > 0 {
+				usermsg = content + "\n\n" + usermsg
+			} else {
+				usermsg = content
+			}
 		}
 	}
 

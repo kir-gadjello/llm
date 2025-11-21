@@ -40,6 +40,21 @@ JSON schema support for llama.cpp and compatible backends:
 llm -J '{"type": "string", "enum": ["yes", "no"]}' "is pi > e"
 ```
 
+### Piped Input
+
+By default, piped stdin content is wrapped with `<context>` tags for clarity:
+
+```bash
+cat file.txt | llm "summarize this"
+# Sends: <context>\n{file contents}\n</context>\n\nsummarize this
+
+# Use custom wrapper tag
+echo "data" | llm -w "input" "analyze"
+
+# Disable wrapping
+echo "data" | llm -w "" "analyze"
+```
+
 ## Configuration
 
 Create `~/.llmterm.yaml` for model profiles:
@@ -74,6 +89,9 @@ Use with `-m <profile>`. CLI flags override config values.
 - `reasoning_max_tokens`: integer token budget
 - `reasoning_exclude`: exclude reasoning from response
 - `context_order`: prepend, append (for clipboard)
+
+**Top-level parameters:**
+- `piped_input_wrapper`: wrapper tag for piped stdin (default: "context", empty string disables)
 
 ## Compatibility
 

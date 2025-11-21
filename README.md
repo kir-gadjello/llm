@@ -15,6 +15,27 @@ echo "data" | llm "analyze this"
 llm -c  # interactive chat
 ```
 
+### Shell Assistant
+Quickly generate and execute a shell command with context awareness, using natural language. The assistant detects your shell (zsh, bash, fish, etc.) and OS to generate precise syntax, ready to execute at the press of a button.
+
+```bash
+llm -s "find all typescript files excluding node_modules"
+# Generates: find . -type f -name "*.ts" ! -path "*/node_modules/*"
+```
+
+**Interactive Mode**
+By default, commands are shown in an interactive menu:
+- **Execute**: Run the command immediately
+- **Revise**: Refine the command with further natural language
+- **Describe**: Get a detailed explanation of what the command does
+- **Copy**: Copy to clipboard
+
+**YOLO Mode**
+For automation or power users, skip the confirmation menu:
+```bash
+llm -s -y "git branch --show-current"
+```
+
 ### Reasoning Models
 
 Control reasoning token generation for models that support it (OpenAI o-series, Grok, etc.):

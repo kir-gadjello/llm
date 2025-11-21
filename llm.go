@@ -374,10 +374,15 @@ type ModelConfig struct {
 	Extend             *string                `yaml:"extend,omitempty"`
 }
 
+type ShellConfig struct {
+	Yolo *bool `yaml:"yolo,omitempty"`
+}
+
 type ConfigFile struct {
 	Default           string                 `yaml:"default,omitempty"`
 	PipedInputWrapper *string                `yaml:"piped_input_wrapper,omitempty"`
 	Models            map[string]ModelConfig `yaml:"models,omitempty"`
+	Shell             *ShellConfig           `yaml:"shell,omitempty"`
 }
 
 func loadConfig() (*ConfigFile, error) {
@@ -601,7 +606,7 @@ func main() {
 	rootCmd.Flags().StringP("model", "m", "", "LLM model: OPENAI_API_MODEL,GROQ_API_MODEL,LLM_MODEL from env or gpt-3.5-turbo")
 	rootCmd.Flags().StringP("prompt", "p", "", "System prompt")
 	rootCmd.Flags().Float64P("temperature", "t", 0.0, "Temperature")
-	rootCmd.Flags().IntP("seed", "s", 1337, "Random seed")
+	rootCmd.Flags().IntP("seed", "r", 1337, "Random seed")
 	rootCmd.Flags().IntP("max_tokens", "N", 4096, "Max amount of tokens in response")
 	rootCmd.Flags().BoolP("stream", "S", is_terminal, "Stream output")
 
@@ -635,6 +640,10 @@ func main() {
 	rootCmd.Flags().StringP("stop", "X", "", "Stop sequences (a single word or a json array)")
 	rootCmd.Flags().BoolP("debug", "D", false, "Output prompt & system msg")
 	rootCmd.Flags().BoolP("verbose", "v", false, "http & debug logging")
+
+	// Shell Assistant
+	rootCmd.Flags().BoolP("shell", "s", false, "Shell Assistant: generate and execute shell commands")
+	rootCmd.Flags().BoolP("yolo", "y", false, "Shell Assistant: execute commands without confirmation")
 
 	// Legacy short flags for backward compatibility
 	rootCmd.Flags().Lookup("chat-send").ShorthandDeprecated = "use --chat-send instead"
@@ -740,6 +749,12 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	useClipboard, _ := cmd.Flags().GetBool("clipboard")
 	contextOrder, _ := cmd.Flags().GetString("context-order")
 	pipedWrapper, _ := cmd.Flags().GetString("piped-wrapper")
+
+	// Shell Assistant
+	shellMode, _ := cmd.Flags().GetBool("shell")
+	if shellMode {
+		return runShellAssistant(cmd, args, cfg)
+	}
 
 	var configExtraBody map[string]interface{}
 

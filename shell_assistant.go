@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/spf13/cobra"
@@ -60,12 +61,14 @@ Environment Context:
 	verbose, _ := cmd.Flags().GetBool("verbose")
 	debug, _ := cmd.Flags().GetBool("debug")
 
+	var timings Timings
 	if debug {
 		fmt.Printf("System Prompt:\n%s\n\nUser Request:\n%s\n", systemPrompt, userRequest)
-		return nil
+		timings.BinaryStartup = time.Since(startTime)
 	}
 
 	// Call LLM
+	llmCallStartTime := time.Now()
 	extra := map[string]interface{}{
 		"max_tokens": maxTokens,
 	}
@@ -74,9 +77,23 @@ Environment Context:
 		return err
 	}
 
+	if debug {
+		timings.TimeToFirstLLMCall = llmCallStartTime.Sub(startTime)
+	}
+
 	var fullResponse strings.Builder
+	firstChunk := true
 	for chunk := range ch {
+		if debug && firstChunk {
+			timings.TimeToFirstChunk = time.Since(startTime)
+			firstChunk = false
+		}
 		fullResponse.WriteString(chunk)
+	}
+
+	if debug {
+		timings.TimeToComplete = time.Since(startTime)
+		displayTimings(timings)
 	}
 
 	generatedCommand := extractCommand(fullResponse.String())

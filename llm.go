@@ -37,8 +37,26 @@ import (
 
 var TEXTINPUT_PLACEHOLDER = "Type a message and press Enter to send..."
 
+var startTime = time.Now()
+
 func is_interactive(fd uintptr) bool {
 	return isatty.IsTerminal(fd) || isatty.IsCygwinTerminal(fd)
+}
+
+type Timings struct {
+	BinaryStartup      time.Duration
+	TimeToFirstLLMCall time.Duration
+	TimeToFirstChunk   time.Duration
+	TimeToComplete     time.Duration
+}
+
+func displayTimings(t Timings) {
+	fmt.Fprintf(os.Stderr, "\n=== TIMING INFORMATION ===\n")
+	fmt.Fprintf(os.Stderr, "Binary Startup:        %v\n", t.BinaryStartup)
+	fmt.Fprintf(os.Stderr, "Time to First LLM Call: %v\n", t.TimeToFirstLLMCall)
+	fmt.Fprintf(os.Stderr, "Time to First Response: %v\n", t.TimeToFirstChunk)
+	fmt.Fprintf(os.Stderr, "Time to Complete:       %v\n", t.TimeToComplete)
+	fmt.Fprintf(os.Stderr, "==========================\n")
 }
 
 type LLMChatRequestBasic struct {
@@ -704,6 +722,7 @@ func getFirstEnv(fallback string, envVars ...string) string {
 }
 
 func runLLMChat(cmd *cobra.Command, args []string) error {
+	preRunTime := time.Now()
 	session := newSession()
 
 	modelname, _ := cmd.Flags().GetString("model")
@@ -913,12 +932,12 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 		log.Fatal(err)
 	}
 
-	timeout := 1 * time.Second // set a 10-second timeout
-	models, err := getModelList(apiKey, apiBase, timeout)
-	if err != nil {
-		log.Fatal(err)
-	}
 	if verbose {
+		timeout := 1 * time.Second // set a 10-second timeout
+		models, err := getModelList(apiKey, apiBase, timeout)
+		if err != nil {
+			log.Fatal(err)
+		}
 		for _, model := range models {
 			fmt.Println(model.ID, model.Meta)
 		}
@@ -959,8 +978,7 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	reasoningConfiguredExclude = reasoningExclude
 
 	if debug {
-		fmt.Printf("PROMPT: \"%s\"\nSYSTEM MESSAGE: \"%s\"", usermsg, systemPrompt)
-		return nil
+		fmt.Printf("PROMPT: \"%s\"\nSYSTEM MESSAGE: \"%s\"\n", usermsg, systemPrompt)
 	}
 
 	markChatStart(session, usermsg, systemPrompt, modelname, seed, temperature, apiBase, maxTokens, jsonMode, stopSeqInterface, extraParams, jsonSchema, reasoningEffort, reasoningConfiguredMax, reasoningConfiguredExclude)
@@ -1079,15 +1097,35 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 		messages = append(messages, *NewMessage("user", usermsg))
 	}
 
+	var timings Timings
+	if debug {
+		timings.BinaryStartup = preRunTime.Sub(startTime)
+	}
+
+	llmCallStartTime := time.Now()
 	ch, err := llmApiFunc(messages)
+
+	if debug {
+		timings.TimeToFirstLLMCall = llmCallStartTime.Sub(startTime)
+	}
 
 	if err != nil {
 		fmt.Println(err)
 		return err
 	}
 
+	firstChunk := true
 	for content := range ch {
+		if debug && firstChunk {
+			timings.TimeToFirstChunk = time.Since(startTime)
+			firstChunk = false
+		}
 		fmt.Print(content)
+	}
+
+	if debug {
+		timings.TimeToComplete = time.Since(startTime)
+		displayTimings(timings)
 	}
 
 	return nil

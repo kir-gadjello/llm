@@ -104,6 +104,75 @@ echo "data" | llm -w "input" "analyze"
 echo "data" | llm -w "" "analyze"
 ```
 
+### File Context & Auto-Selection
+
+Include code files and let the LLM intelligently select relevant files based on your query.
+
+**Manual File Selection**
+
+```bash
+# Include specific files
+llm -f src/main.go -f lib/utils.go "explain the architecture"
+
+# Include directories (walks and loads all files)
+llm -f src/ "review the codebase"
+
+# Use glob patterns
+llm -f "src/**/*.go" "find all error handling"
+```
+
+**Git Integration with @ Syntax**
+
+Reference files from git context directly in your prompt:
+
+```bash
+# Review staged changes
+llm "@staged review these changes before commit"
+
+# Analyze uncommitted modifications
+llm "@dirty what bugs might these changes introduce"
+
+# Examine last commit
+llm "@last explain what this commit does"
+
+# Reference specific files with @ prefix
+llm "@src/main.go @lib/config.go how do these interact"
+
+# Combine git aliases with manual files
+llm -f README.md "@staged document these changes"
+```
+
+**Git Aliases:**
+- `@staged` - Files in git staging area (`git diff --name-only --cached`)
+- `@dirty` - Modified but unstaged files (`git diff --name-only`)
+- `@last` - Files changed in last commit (`git diff-tree --no-commit-id --name-only -r HEAD`)
+
+**Auto-Selection Mode (-A)**
+
+Let the LLM automatically select relevant files using a repository map:
+
+```bash
+# Auto-select files based on query
+llm -A "find the session parser implementation"
+
+# Combine auto-selection with manual files
+llm -A -f config.yaml "how is authentication configured"
+
+# Works with git syntax too
+llm -A "@staged ensure these changes don't break auth"
+```
+
+**How Auto-Mode Works:**
+1. Generates a structural map of your repository using tree-sitter
+2. Sends the map + your query to an LLM (configurable model)
+3. LLM returns relevant file paths as JSON
+4. Files are loaded and included in context
+5. Shows selected files: `reviewed: main.go, auth.go, session.go`
+
+**Binary File Handling**
+
+Binary files are automatically detected and replaced with `[Binary File]` placeholders to avoid sending garbage to the LLM.
+
 ## Configuration
 
 Create `~/.llmterm.yaml` for model profiles with inheritance:
@@ -140,7 +209,16 @@ models:
   local-llama:
     model: llama-3-8b-Instruct-q6
     api_base: http://localhost:8080/v1
+
+# File context and auto-selection settings
+context:
+  auto_selector_model: "x-ai/grok-4.1-fast"  # Model for -A flag (empty = use main model)
+  max_file_size_kb: 1024                      # Skip files larger than this
+  max_repo_files: 1000                        # Max files in repo map
+  ignored_dirs: [".git", "node_modules", "dist", "vendor", "__pycache__"]
+  debug_truncate_files: 10                    # Truncate file context in debug output
 ```
+
 
 Use with `-m <profile>`. CLI flags override config values.
 
@@ -162,6 +240,13 @@ Use with `-m <profile>`. CLI flags override config values.
 **Top-level parameters:**
 - `default`: default model profile to use
 - `piped_input_wrapper`: wrapper tag for piped stdin (default: "context", empty string disables)
+
+**Context configuration (`context`):**
+- `auto_selector_model`: model to use for `-A` auto-selection (empty = use main model)
+- `max_file_size_kb`: maximum file size to load (default: 1024 KB)
+- `max_repo_files`: maximum number of files to include in repo map (default: 1000)
+- `ignored_dirs`: directories to skip when generating repo maps
+- `debug_truncate_files`: number of lines to show per file in debug output (default: 10)
 
 ## Compatibility
 

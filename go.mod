@@ -14,7 +14,10 @@ require github.com/charmbracelet/bubbles v0.18.0
 
 require (
 	github.com/charmbracelet/lipgloss v0.9.1
+	github.com/creack/pty v1.1.24
+	github.com/smacker/go-tree-sitter v0.0.0-20240827094217-dd81d9e9be82
 	github.com/vlanse/go-term-markdown v0.0.1-dev2
+	golang.org/x/term v0.37.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -23,7 +26,6 @@ require (
 	github.com/alecthomas/chroma v0.10.0 // indirect
 	github.com/atotto/clipboard v0.1.4 // indirect
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
-	github.com/creack/pty v1.1.24 // indirect
 	github.com/disintegration/imaging v1.6.2 // indirect
 	github.com/dlclark/regexp2 v1.10.0 // indirect
 	github.com/eliukblau/pixterm v1.3.1 // indirect
@@ -46,7 +48,6 @@ require (
 	golang.org/x/net v0.21.0 // indirect
 	golang.org/x/sync v0.7.0 // indirect
 	golang.org/x/sys v0.38.0 // indirect
-	golang.org/x/term v0.37.0 // indirect
 	golang.org/x/text v0.14.0 // indirect
 
 )

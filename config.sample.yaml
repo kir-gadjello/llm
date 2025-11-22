@@ -57,3 +57,25 @@ models:
     reasoning_effort: high
   deepseek/deepseek-v3.2-exp:
     extend: deepseek
+
+# Context & File Resolution Settings
+context:
+  # Model to use for auto file selection (-A flag)
+  # If empty or not set, uses the main model
+  auto_selector_model: ""
+  
+  # Maximum file size to load (in KB)
+  max_file_size_kb: 1024
+  
+  # Maximum number of files to include in repo map
+  max_repo_files: 1000
+  
+  # Directories to ignore when scanning repo
+  ignored_dirs:
+    - .git
+    - node_modules
+    - dist
+    - vendor
+    - __pycache__
+    - .next
+    - build

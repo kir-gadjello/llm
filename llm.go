@@ -391,6 +391,29 @@ func getModelList(apiKey string, apiBase string, timeout time.Duration) ([]Model
 	return modelList.Data, nil
 }
 
+func formatContextXML(files []FileContext, truncateLimit int) string {
+	var buf strings.Builder
+	buf.WriteString("<context>\n<files>\n")
+	for _, f := range files {
+		buf.WriteString(fmt.Sprintf("<file path=\"%s\">\n", f.Path))
+		if f.IsBinary {
+			buf.WriteString("[Binary File]\n")
+		} else {
+			content := f.Content
+			if truncateLimit > 0 {
+				lines := strings.Split(content, "\n")
+				if len(lines) > truncateLimit {
+					content = strings.Join(lines[:truncateLimit], "\n") + fmt.Sprintf("\n... [truncated %d lines] ...", len(lines)-truncateLimit)
+				}
+			}
+			buf.WriteString(content)
+		}
+		buf.WriteString("\n</file>\n")
+	}
+	buf.WriteString("</files>\n</context>")
+	return buf.String()
+}
+
 type ModelConfig struct {
 	Model              *string                `yaml:"model,omitempty"`
 	ApiBase            *string                `yaml:"api_base,omitempty"`
@@ -410,11 +433,20 @@ type ShellConfig struct {
 	Yolo *bool `yaml:"yolo,omitempty"`
 }
 
+type ContextConfig struct {
+	AutoSelectorModel  *string  `yaml:"auto_selector_model,omitempty"`
+	MaxFileSizeKB      *int     `yaml:"max_file_size_kb,omitempty"`
+	MaxRepoFiles       *int     `yaml:"max_repo_files,omitempty"`
+	IgnoredDirs        []string `yaml:"ignored_dirs,omitempty"`
+	DebugTruncateFiles *int     `yaml:"debug_truncate_files,omitempty"`
+}
+
 type ConfigFile struct {
 	Default           string                 `yaml:"default,omitempty"`
 	PipedInputWrapper *string                `yaml:"piped_input_wrapper,omitempty"`
 	Models            map[string]ModelConfig `yaml:"models,omitempty"`
 	Shell             *ShellConfig           `yaml:"shell,omitempty"`
+	Context           *ContextConfig         `yaml:"context,omitempty"`
 }
 
 func loadConfig() (*ConfigFile, error) {
@@ -422,19 +454,58 @@ func loadConfig() (*ConfigFile, error) {
 	if err != nil {
 		return nil, err
 	}
-	configPath := filepath.Join(home, ".llmterm.yaml")
+
+	// New config location
+	configDir := filepath.Join(home, ".llmterm")
+	configPath := filepath.Join(configDir, "config.yaml")
+
+	// Old config location (for backward compatibility)
+	oldConfigPath := filepath.Join(home, ".llmterm.yaml")
+
+	// Try new location first
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return &ConfigFile{}, nil
+			// Try old location
+			data, err = os.ReadFile(oldConfigPath)
+			if err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					// No config file exists, create directory structure and return empty config
+					if err := os.MkdirAll(configDir, 0o755); err != nil {
+						return nil, fmt.Errorf("failed to create config directory: %w", err)
+					}
+					// Also create cache directory
+					cacheDir := filepath.Join(configDir, "cache")
+					if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+						return nil, fmt.Errorf("failed to create cache directory: %w", err)
+					}
+					return &ConfigFile{}, nil
+				}
+				return nil, err
+			}
+			// Found old config, use it but warn user
+			fmt.Fprintf(os.Stderr, "Note: Using config from %s. Consider moving it to %s\n",
+				oldConfigPath, configPath)
+		} else {
+			return nil, err
 		}
-		return nil, err
 	}
+
 	var cfg ConfigFile
 	err = yaml.Unmarshal(data, &cfg)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse %s: %w", configPath, err)
+		return nil, fmt.Errorf("failed to parse config: %w", err)
 	}
+
+	// Ensure directory structure exists
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		return nil, fmt.Errorf("failed to create config directory: %w", err)
+	}
+	cacheDir := filepath.Join(configDir, "cache")
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		return nil, fmt.Errorf("failed to create cache directory: %w", err)
+	}
+
 	return &cfg, nil
 }
 
@@ -779,6 +850,7 @@ func main() {
 	rootCmd.Flags().StringP("piped-wrapper", "w", "context", "Wrapper tag for piped stdin (empty string disables wrapping)")
 	rootCmd.Flags().StringSliceP("files", "f", []string{}, "List of files and directories to include in context")
 	rootCmd.Flags().StringP("context-format", "i", "md", "Context (files) input template format (md|xml)")
+	rootCmd.Flags().BoolP("auto", "A", false, "Auto-select files using LLM")
 
 	// API/Debug
 	rootCmd.Flags().StringP("api-key", "k", "", "OpenAI API key")
@@ -1048,9 +1120,155 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 		messages = append(messages, *NewMessage("system", systemPrompt))
 	}
 
+	// === File Context Resolution ===
+	autoFlag, _ := cmd.Flags().GetBool("auto")
+	filesFlag, _ := cmd.Flags().GetStringSlice("files")
+
+	// Construct initial user message to parse for @ tokens
+	var usermsg string = strings.Join(args, " ")
+
+	resolver := NewPathResolver(verbose)
+	cleanedPrompt, atPaths := resolver.ParsePrompt(usermsg)
+
+	// If we found @ tokens, update the user message to the cleaned version
+	if len(atPaths) > 0 {
+		usermsg = cleanedPrompt
+	}
+
+	allPaths := append(filesFlag, atPaths...)
+
+	// Resolve paths (expand globs, git aliases, etc)
+	resolvedPaths, err := resolver.Resolve(allPaths)
+	if err != nil {
+		if verbose {
+			fmt.Fprintf(os.Stderr, "Warning: path resolution error: %v\n", err)
+		}
+	}
+
+	// Auto-Mode
+	if autoFlag {
+		// Initialize indexer
+		ignoredDirs := []string{".git", "node_modules", "dist", "vendor", "__pycache__"}
+		maxRepoFiles := 1000
+		if cfg.Context != nil {
+			if len(cfg.Context.IgnoredDirs) > 0 {
+				ignoredDirs = cfg.Context.IgnoredDirs
+			}
+			if cfg.Context.MaxRepoFiles != nil {
+				maxRepoFiles = *cfg.Context.MaxRepoFiles
+			}
+		}
+
+		indexer := NewRepoIndexer(ignoredDirs, maxRepoFiles, verbose)
+		repoMap, err := indexer.GenerateRepoMap(".")
+		if err != nil {
+			if verbose {
+				fmt.Fprintf(os.Stderr, "Warning: failed to generate repo map: %v\n", err)
+			}
+		} else {
+			// Initialize selector
+			selector := NewAutoSelector(verbose)
+			selectorModel := modelname
+			if cfg.Context != nil && cfg.Context.AutoSelectorModel != nil && *cfg.Context.AutoSelectorModel != "" {
+				selectorModel = *cfg.Context.AutoSelectorModel
+			}
+
+			// Start pulsating magenta color animation (Bubble Tea style)
+			stopAnimation := make(chan bool)
+			var animWg sync.WaitGroup
+			animWg.Add(1)
+			go func() {
+				defer animWg.Done()
+				// Magenta color gradient for smooth pulsation (256-color ANSI)
+				// Creates breathing effect from dim to bright magenta
+				colorFrames := []string{
+					"\033[38;5;126m", // Dim magenta
+					"\033[38;5;162m", // Medium-dim magenta
+					"\033[38;5;198m", // Medium magenta
+					"\033[38;5;199m", // Medium-bright magenta
+					"\033[38;5;200m", // Bright magenta
+					"\033[38;5;201m", // Very bright magenta
+					"\033[38;5;200m", // Bright magenta (reverse)
+					"\033[38;5;199m", // Medium-bright magenta (reverse)
+					"\033[38;5;198m", // Medium magenta (reverse)
+					"\033[38;5;162m", // Medium-dim magenta (reverse)
+				}
+				frameIdx := 0
+				reset := "\033[0m"
+				for {
+					select {
+					case <-stopAnimation:
+						fmt.Fprintf(os.Stderr, "\r\033[K") // Clear line
+						return
+					case <-time.After(120 * time.Millisecond):
+						color := colorFrames[frameIdx]
+						fmt.Fprintf(os.Stderr, "\r%s■ analyzing...%s", color, reset)
+						frameIdx = (frameIdx + 1) % len(colorFrames)
+					}
+				}
+			}()
+
+			// Use resolved API key/base for selector if needed, or default to main
+			// Note: We use the main model's config for the selector for now
+			autoPaths, err := selector.SelectFiles(usermsg, repoMap, selectorModel, apiKey, apiBase, debug)
+
+			// Stop animation
+			close(stopAnimation)
+			animWg.Wait()
+
+			if err != nil {
+				if verbose {
+					fmt.Fprintf(os.Stderr, "Warning: auto-selection failed: %v\n", err)
+				}
+			} else {
+				resolvedPaths = append(resolvedPaths, autoPaths...)
+
+				// Display loaded files in magenta
+				if len(autoPaths) > 0 {
+					magenta := "\033[35m"
+					reset := "\033[0m"
+					fmt.Fprintf(os.Stderr, "%sreviewed: %s%s\n", magenta, strings.Join(autoPaths, ", "), reset)
+				}
+			}
+		}
+	}
+
 	// === Context Collection ===
 	var contextBuilder strings.Builder
+	var debugContextBuilder strings.Builder
 	hasContext := false
+
+	// 0. File Context
+	if len(resolvedPaths) > 0 {
+		maxSizeKB := 1024
+		if cfg.Context != nil && cfg.Context.MaxFileSizeKB != nil {
+			maxSizeKB = *cfg.Context.MaxFileSizeKB
+		}
+
+		loader := NewFileLoader(maxSizeKB, verbose)
+		fileContexts, err := loader.LoadAll(resolvedPaths)
+		if err != nil {
+			if verbose {
+				fmt.Fprintf(os.Stderr, "Warning: failed to load files: %v\n", err)
+			}
+		}
+
+		if len(fileContexts) > 0 {
+			// Full context for LLM
+			xmlContext := formatContextXML(fileContexts, -1)
+			contextBuilder.WriteString(xmlContext + "\n")
+
+			// Truncated context for debug output
+			truncateLimit := 10 // Default 10 lines
+			if cfg.Context != nil && cfg.Context.DebugTruncateFiles != nil {
+				truncateLimit = *cfg.Context.DebugTruncateFiles
+			}
+			debugXmlContext := formatContextXML(fileContexts, truncateLimit)
+			debugContextBuilder.WriteString(debugXmlContext + "\n")
+
+			hasContext = true
+		}
+	}
 
 	// 1. Piped Input
 	stat, _ := os.Stdin.Stat()
@@ -1066,10 +1284,13 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 			content := strings.TrimRight(pipedContent.String(), "\n")
 			if pipedWrapper != "" {
 				// Wrap with custom or default wrapper
-				contextBuilder.WriteString(fmt.Sprintf("<%s>\n%s\n</%s>\n", pipedWrapper, content, pipedWrapper))
+				formatted := fmt.Sprintf("<%s>\n%s\n</%s>\n", pipedWrapper, content, pipedWrapper)
+				contextBuilder.WriteString(formatted)
+				debugContextBuilder.WriteString(formatted)
 			} else {
 				// No wrapper - just raw content
 				contextBuilder.WriteString(content + "\n")
+				debugContextBuilder.WriteString(content + "\n")
 			}
 			hasContext = true
 		}
@@ -1084,7 +1305,9 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 		} else {
 			clipboardContent := string(clipboardOutput)
 			if len(clipboardContent) > 0 {
-				contextBuilder.WriteString(fmt.Sprintf("<clipboard>\n%s\n</clipboard>\n", clipboardContent))
+				formatted := fmt.Sprintf("<clipboard>\n%s\n</clipboard>\n", clipboardContent)
+				contextBuilder.WriteString(formatted)
+				debugContextBuilder.WriteString(formatted)
 				hasContext = true
 			}
 		}
@@ -1094,27 +1317,34 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	if historyContext != "" {
 		// historyContext already has tags <context-user-shell-history>
 		contextBuilder.WriteString(historyContext)
+		debugContextBuilder.WriteString(historyContext)
 		hasContext = true
 	}
 
 	// === Construct Final Message ===
-	var usermsg string = strings.Join(args, " ")
+	// usermsg is already defined above
+	var debugUsermsg string = usermsg
 
 	if hasContext {
 		fullContext := strings.TrimSpace(contextBuilder.String())
+		debugContext := strings.TrimSpace(debugContextBuilder.String())
 
 		if contextOrder == "append" {
 			if len(usermsg) > 0 {
 				usermsg = usermsg + "\n\n" + fullContext
+				debugUsermsg = debugUsermsg + "\n\n" + debugContext
 			} else {
 				usermsg = fullContext
+				debugUsermsg = debugContext
 			}
 		} else {
 			// Default: prepend
 			if len(usermsg) > 0 {
 				usermsg = fullContext + "\n\n" + usermsg
+				debugUsermsg = debugContext + "\n\n" + debugUsermsg
 			} else {
 				usermsg = fullContext
+				debugUsermsg = debugContext
 			}
 		}
 	}
@@ -1170,7 +1400,7 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	reasoningConfiguredExclude = reasoningExclude
 
 	if debug {
-		fmt.Printf("PROMPT: \"%s\"\nSYSTEM MESSAGE: \"%s\"\n", usermsg, systemPrompt)
+		fmt.Printf("PROMPT: \"%s\"\nSYSTEM MESSAGE: \"%s\"\n", debugUsermsg, systemPrompt)
 	}
 
 	markChatStart(session, usermsg, systemPrompt, modelname, seed, temperature, apiBase, maxTokens, jsonMode, stopSeqInterface, extraParams, jsonSchema, reasoningEffort, reasoningConfiguredMax, reasoningConfiguredExclude)

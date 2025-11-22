@@ -1064,11 +1064,13 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 
 		if pipedContent.Len() > 0 {
 			content := strings.TrimRight(pipedContent.String(), "\n")
-			wrapper := "piped-data"
 			if pipedWrapper != "" {
-				wrapper = pipedWrapper
+				// Wrap with custom or default wrapper
+				contextBuilder.WriteString(fmt.Sprintf("<%s>\n%s\n</%s>\n", pipedWrapper, content, pipedWrapper))
+			} else {
+				// No wrapper - just raw content
+				contextBuilder.WriteString(content + "\n")
 			}
-			contextBuilder.WriteString(fmt.Sprintf("<%s>\n%s\n</%s>\n", wrapper, content, wrapper))
 			hasContext = true
 		}
 	}
@@ -1099,7 +1101,7 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	var usermsg string = strings.Join(args, " ")
 
 	if hasContext {
-		fullContext := fmt.Sprintf("<context>\n%s\n</context>", strings.TrimSpace(contextBuilder.String()))
+		fullContext := strings.TrimSpace(contextBuilder.String())
 
 		if contextOrder == "append" {
 			if len(usermsg) > 0 {

@@ -1,0 +1,59 @@
+default: grok
+piped_input_wrapper: "data"
+
+models:
+  # Base OpenRouter Configuration
+  _openrouter:
+    api_base: https://openrouter.ai/api/v1
+    extra_body:
+      include_reasoning: true
+      stream_options:
+        include_usage: true
+
+  # Grok (Default, Low Reasoning)
+  grok:
+    extend: _openrouter
+    model: x-ai/grok-4.1-fast
+    reasoning_effort: low
+  x-ai/grok-4.1-fast:
+    extend: grok
+
+  # Codex
+  codex:
+    extend: _openrouter
+    model: gpt-5.1-codex
+    reasoning_effort: high
+  gpt-5.1-codex:
+    extend: codex
+
+  # Minimax
+  minimax:
+    extend: _openrouter
+    model: minimax/minimax-m2
+    reasoning_effort: high
+  minimax/minimax-m2:
+    extend: minimax
+
+  # Kimi
+  kimi:
+    extend: _openrouter
+    model: moonshotai/kimi-k2-thinking
+    reasoning_effort: high
+  moonshotai/kimi-k2-thinking:
+    extend: kimi
+
+  # GLM
+  glm:
+    extend: _openrouter
+    model: z-ai/glm-4.6:exacto
+    reasoning_effort: high
+  z-ai/glm-4.6:exacto:
+    extend: glm
+
+  # Deepseek
+  deepseek:
+    extend: _openrouter
+    model: deepseek/deepseek-v3.2-exp
+    reasoning_effort: high
+  deepseek/deepseek-v3.2-exp:
+    extend: deepseek

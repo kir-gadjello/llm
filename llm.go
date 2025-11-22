@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
@@ -219,6 +218,12 @@ func llmChat(
 			return nil, err
 		}
 
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			return nil, fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
+		}
+
 		ch := make(chan string)
 
 		go func() {
@@ -265,7 +270,7 @@ func llmChat(
 						continue
 					}
 
-					if resp.Choices[0].Delta.Content != "" {
+					if len(resp.Choices) > 0 && resp.Choices[0].Delta.Content != "" {
 						content := resp.Choices[0].Delta.Content
 						if postprocess != nil {
 							content = postprocess(content)
@@ -307,6 +312,11 @@ func llmChat(
 
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
+	}
+
 	var respBody struct {
 		Choices []struct {
 			Message struct {
@@ -317,6 +327,10 @@ func llmChat(
 	err = json.NewDecoder(resp.Body).Decode(&respBody)
 	if err != nil {
 		return nil, err
+	}
+
+	if len(respBody.Choices) == 0 {
+		return nil, fmt.Errorf("no choices returned from API")
 	}
 
 	content := respBody.Choices[0].Message.Content
@@ -527,6 +541,117 @@ func resolveModelConfigRec(cfg *ConfigFile, modelName string, visited map[string
 	return modelCfg, nil
 }
 
+type RunConfig struct {
+	ModelName          string
+	ApiKey             string
+	ApiBase            string
+	Temperature        float64
+	Seed               int
+	MaxTokens          int
+	ReasoningEffort    string
+	ReasoningMaxTokens int
+	ReasoningExclude   bool
+	ContextOrder       string
+	ExtraBody          map[string]interface{}
+}
+
+func getRunConfig(cmd *cobra.Command, cfg *ConfigFile, modelname string) (RunConfig, error) {
+	// 1. Initial values from flags (defaults or user-provided)
+	apiKey, _ := cmd.Flags().GetString("api-key")
+	apiBase, _ := cmd.Flags().GetString("api-base")
+	temperature, _ := cmd.Flags().GetFloat64("temperature")
+	seed, _ := cmd.Flags().GetInt("seed")
+	maxTokens, _ := cmd.Flags().GetInt("max_tokens")
+	contextOrder, _ := cmd.Flags().GetString("context-order")
+
+	// Reasoning flags
+	noReasoning, _ := cmd.Flags().GetBool("no-reasoning")
+	reasoningLow, _ := cmd.Flags().GetBool("reasoning-low")
+	reasoningMedium, _ := cmd.Flags().GetBool("reasoning-medium")
+	reasoningHigh, _ := cmd.Flags().GetBool("reasoning-high")
+	reasoningMax, _ := cmd.Flags().GetInt("reasoning-max")
+	reasoningExclude, _ := cmd.Flags().GetBool("reasoning-exclude")
+
+	reasoningEffort := ""
+	if noReasoning {
+		reasoningEffort = "none"
+	} else if reasoningLow {
+		reasoningEffort = "low"
+	} else if reasoningMedium {
+		reasoningEffort = "medium"
+	} else if reasoningHigh {
+		reasoningEffort = "high"
+	}
+
+	extraBody := make(map[string]interface{})
+
+	// 2. Resolve Model Config from file
+	if len(modelname) > 0 {
+		resolvedCfg, err := resolveModelConfig(cfg, modelname)
+		if err != nil {
+			// Log warning but continue with flags
+			// log.Printf("Warning: failed to resolve config for model %s: %v", modelname, err)
+		} else {
+			if resolvedCfg.Model != nil {
+				modelname = *resolvedCfg.Model
+			}
+			if resolvedCfg.ApiKey != nil && !cmd.Flags().Changed("api-key") {
+				apiKey = *resolvedCfg.ApiKey
+			}
+			if resolvedCfg.ApiBase != nil && !cmd.Flags().Changed("api-base") {
+				apiBase = *resolvedCfg.ApiBase
+			}
+			if resolvedCfg.Temperature != nil && !cmd.Flags().Changed("temperature") {
+				temperature = *resolvedCfg.Temperature
+			}
+			if resolvedCfg.Seed != nil && !cmd.Flags().Changed("seed") {
+				seed = *resolvedCfg.Seed
+			}
+			if resolvedCfg.MaxTokens != nil && !cmd.Flags().Changed("max_tokens") {
+				maxTokens = *resolvedCfg.MaxTokens
+			}
+
+			// Apply reasoning config if not specified via flags
+			reasoningFlagsChanged := cmd.Flags().Changed("no-reasoning") ||
+				cmd.Flags().Changed("reasoning-low") ||
+				cmd.Flags().Changed("reasoning-medium") ||
+				cmd.Flags().Changed("reasoning-high")
+
+			if resolvedCfg.ReasoningEffort != nil && !reasoningFlagsChanged {
+				reasoningEffort = *resolvedCfg.ReasoningEffort
+			}
+			if resolvedCfg.ReasoningMaxTokens != nil && !cmd.Flags().Changed("reasoning-max") {
+				reasoningMax = *resolvedCfg.ReasoningMaxTokens
+			}
+			if resolvedCfg.ReasoningExclude != nil && !cmd.Flags().Changed("reasoning-exclude") {
+				reasoningExclude = *resolvedCfg.ReasoningExclude
+			}
+			if resolvedCfg.ContextOrder != nil && !cmd.Flags().Changed("context-order") {
+				contextOrder = *resolvedCfg.ContextOrder
+			}
+
+			// Merge ExtraBody
+			if resolvedCfg.ExtraBody != nil {
+				extraBody = mergeMaps(extraBody, resolvedCfg.ExtraBody)
+			}
+		}
+	}
+
+	return RunConfig{
+		ModelName:          modelname,
+		ApiKey:             apiKey,
+		ApiBase:            apiBase,
+		Temperature:        temperature,
+		Seed:               seed,
+		MaxTokens:          maxTokens,
+		ReasoningEffort:    reasoningEffort,
+		ReasoningMaxTokens: reasoningMax,
+		ReasoningExclude:   reasoningExclude,
+		ContextOrder:       contextOrder,
+		ExtraBody:          extraBody,
+	}, nil
+}
+
 func putTextIntoClipboard(text string) error {
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
@@ -613,10 +738,16 @@ func dumpToHistory(session *Session, data interface{}) error {
 }
 
 func main() {
+
+	// Define Root Command
 	rootCmd := &cobra.Command{
 		Use:   "llm-chat",
 		Short: "LLM Chat CLI tool",
-		RunE:  runLLMChat,
+		// Explicitly allow arbitrary arguments to avoid "unknown command" errors when subcommands exist
+		Args: cobra.ArbitraryArgs,
+		// RunE handles the default behavior (llm "query")
+		RunE:             runLLMChat,
+		TraverseChildren: true,
 	}
 
 	var is_terminal bool = is_interactive(os.Stdout.Fd())
@@ -662,9 +793,42 @@ func main() {
 	// Shell Assistant
 	rootCmd.Flags().BoolP("shell", "s", false, "Shell Assistant: generate and execute shell commands")
 	rootCmd.Flags().BoolP("yolo", "y", false, "Shell Assistant: execute commands without confirmation")
+	rootCmd.Flags().IntP("history", "H", 0, "Include shell history (default 20 lines)")
+	rootCmd.Flags().Lookup("history").NoOptDefVal = "20"
 
-	// Legacy short flags for backward compatibility
+	// Session Mode Flag
+	rootCmd.Flags().Bool("session", false, "Start a transparent shell session with '??' AI interception")
+
+	// Legacy
 	rootCmd.Flags().Lookup("chat-send").ShorthandDeprecated = "use --chat-send instead"
+
+	// NEW: Session Subcommand
+	sessionCmd := &cobra.Command{
+		Use:   "session",
+		Short: "Start a terminal session with AI superpowers",
+		Long:  "Starts your default shell wrapped in a harness. Type '?? your question' to invoke the LLM with full context.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadConfig()
+			if err != nil {
+				cfg = &ConfigFile{}
+			}
+			return runSession(cmd, args, cfg)
+		},
+	}
+	// Propagate flags to session command so they are available inside
+	sessionCmd.Flags().AddFlagSet(rootCmd.Flags())
+	rootCmd.AddCommand(sessionCmd)
+
+	// NEW: Integration Subcommand
+	integrationCmd := &cobra.Command{
+		Use:   "integration [shell]",
+		Short: "Print shell integration scripts (zsh, bash, fish)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return printShellIntegration(args[0])
+		},
+	}
+	rootCmd.AddCommand(integrationCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Println(err)
@@ -722,6 +886,16 @@ func getFirstEnv(fallback string, envVars ...string) string {
 }
 
 func runLLMChat(cmd *cobra.Command, args []string) error {
+	// Check for --session flag alias
+	isSession, _ := cmd.Flags().GetBool("session")
+	if isSession {
+		cfg, err := loadConfig()
+		if err != nil {
+			cfg = &ConfigFile{}
+		}
+		return runSession(cmd, args, cfg)
+	}
+
 	preRunTime := time.Now()
 	session := newSession()
 
@@ -775,67 +949,79 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 		return runShellAssistant(cmd, args, cfg)
 	}
 
+	// Shell History Context
+	historyCount, _ := cmd.Flags().GetInt("history")
+	var historyContext string
+	if historyCount > 0 {
+		shellInfo := detectShell()
+		cmds, err := readShellHistory(shellInfo, historyCount)
+		if err != nil {
+
+			if verbose {
+				fmt.Printf("Warning: failed to read shell history: %v\n", err)
+			}
+		} else if len(cmds) > 0 {
+			var sb strings.Builder
+			sb.WriteString("\n<user-shell-history>\n")
+			for i := 0; i < len(cmds); i++ {
+				idx := i
+				cmd := cmds[i]
+				cmd = strings.ReplaceAll(cmd, "&", "&amp;")
+				cmd = strings.ReplaceAll(cmd, "<", "&lt;")
+				cmd = strings.ReplaceAll(cmd, ">", "&gt;")
+
+				attrs := ""
+				if idx == 0 {
+					attrs = " oldest=\"true\""
+				}
+				if idx == len(cmds)-1 {
+					attrs += " newest=\"true\""
+				}
+				sb.WriteString(fmt.Sprintf("<item index=\"%d\"%s><input>%s</input></item>\n", idx, attrs, cmd))
+			}
+			sb.WriteString("</user-shell-history>\n")
+			historyContext = sb.String()
+		}
+	}
+
 	var configExtraBody map[string]interface{}
 
 	// Apply config profile overrides if modelname matches a profile and flag not explicitly set
-	if len(modelname) > 0 {
-		resolvedCfg, err := resolveModelConfig(cfg, modelname)
-		if err != nil {
-			log.Printf("Warning: failed to resolve config for model %s: %v", modelname, err)
-		} else {
-			if resolvedCfg.Model != nil {
-				modelname = *resolvedCfg.Model
-			}
-			if resolvedCfg.ApiKey != nil && !cmd.Flags().Changed("api-key") {
-				apiKey = *resolvedCfg.ApiKey
-			}
-			if resolvedCfg.ApiBase != nil && !cmd.Flags().Changed("api-base") {
-				apiBase = *resolvedCfg.ApiBase
-			}
-			if resolvedCfg.Temperature != nil && !cmd.Flags().Changed("temperature") {
-				temperature = *resolvedCfg.Temperature
-			}
-			if resolvedCfg.Seed != nil && !cmd.Flags().Changed("seed") {
-				seed = *resolvedCfg.Seed
-			}
-			if resolvedCfg.MaxTokens != nil && !cmd.Flags().Changed("max_tokens") {
-				maxTokens = *resolvedCfg.MaxTokens
-			}
-			// Apply reasoning config if not specified via flags
-			if resolvedCfg.ReasoningEffort != nil && !cmd.Flags().Changed("no-reasoning") && !cmd.Flags().Changed("reasoning-low") && !cmd.Flags().Changed("reasoning-medium") && !cmd.Flags().Changed("reasoning-high") {
-				// Apply the configured reasoning effort
-				switch *resolvedCfg.ReasoningEffort {
-				case "none":
-					noReasoning = true
-				case "low", "minimal":
-					reasoningLow = true
-				case "medium":
-					reasoningMedium = true
-				case "high":
-					reasoningHigh = true
-				}
-			}
-			if resolvedCfg.ReasoningMaxTokens != nil && !cmd.Flags().Changed("reasoning-max") {
-				reasoningMax = *resolvedCfg.ReasoningMaxTokens
-			}
-			if resolvedCfg.ReasoningExclude != nil && !cmd.Flags().Changed("reasoning-exclude") {
-				reasoningExclude = *resolvedCfg.ReasoningExclude
-			}
-			if resolvedCfg.ContextOrder != nil && !cmd.Flags().Changed("context-order") {
-				contextOrder = *resolvedCfg.ContextOrder
-			}
+	// Resolve configuration
+	runCfg, err := getRunConfig(cmd, cfg, modelname)
+	if err != nil {
+		log.Printf("Warning: failed to resolve config: %v", err)
+	}
 
-			// Merge ExtraBody into apiParams if not already present
-			// apiParams from CLI takes precedence, but here we are just preparing the extra map
-			// We will merge it later
-			if resolvedCfg.ExtraBody != nil {
-				// We'll handle this merge when constructing the 'extra' map
-				// For now, let's store it in a temporary variable or merge it into apiParamsMap if possible
-				// But apiParamsMap is parsed from CLI string.
-				// Let's add a variable to hold config extra body
-				configExtraBody = resolvedCfg.ExtraBody
-			}
-		}
+	// Apply resolved config
+	modelname = runCfg.ModelName
+	apiKey = runCfg.ApiKey
+	apiBase = runCfg.ApiBase
+	temperature = runCfg.Temperature
+	seed = runCfg.Seed
+	maxTokens = runCfg.MaxTokens
+	contextOrder = runCfg.ContextOrder
+	configExtraBody = runCfg.ExtraBody
+
+	// Apply reasoning settings
+	reasoningMax = runCfg.ReasoningMaxTokens
+	reasoningExclude = runCfg.ReasoningExclude
+
+	// Reset reasoning flags based on resolved config
+	noReasoning = false
+	reasoningLow = false
+	reasoningMedium = false
+	reasoningHigh = false
+
+	switch runCfg.ReasoningEffort {
+	case "none":
+		noReasoning = true
+	case "low":
+		reasoningLow = true
+	case "medium":
+		reasoningMedium = true
+	case "high":
+		reasoningHigh = true
 	}
 
 	// Apply top-level piped_input_wrapper from config if flag not explicitly set
@@ -862,19 +1048,13 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 		messages = append(messages, *NewMessage("system", systemPrompt))
 	}
 
-	var usermsg string = ""
+	// === Context Collection ===
+	var contextBuilder strings.Builder
+	hasContext := false
 
-	for _, arg := range args {
-		if len(usermsg) > 0 {
-			usermsg += " "
-		}
-		usermsg += arg
-	}
-
-	// Read from stdin if available
+	// 1. Piped Input
 	stat, _ := os.Stdin.Stat()
 	if (stat.Mode() & os.ModeCharDevice) == 0 {
-		// stdin is a pipe or a file, read from it
 		var pipedContent strings.Builder
 		scanner := bufio.NewScanner(os.Stdin)
 		for scanner.Scan() {
@@ -884,22 +1064,16 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 
 		if pipedContent.Len() > 0 {
 			content := strings.TrimRight(pipedContent.String(), "\n")
-
-			// Wrap with tags if wrapper is not empty
+			wrapper := "piped-data"
 			if pipedWrapper != "" {
-				content = "<" + pipedWrapper + ">\n" + content + "\n</" + pipedWrapper + ">"
+				wrapper = pipedWrapper
 			}
-
-			// Prepend piped content to user message
-			if len(usermsg) > 0 {
-				usermsg = content + "\n\n" + usermsg
-			} else {
-				usermsg = content
-			}
+			contextBuilder.WriteString(fmt.Sprintf("<%s>\n%s\n</%s>\n", wrapper, content, wrapper))
+			hasContext = true
 		}
 	}
 
-	// Handle clipboard if requested
+	// 2. Clipboard
 	if useClipboard {
 		clipboardCmd := exec.Command("pbpaste")
 		clipboardOutput, err := clipboardCmd.Output()
@@ -908,21 +1082,37 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 		} else {
 			clipboardContent := string(clipboardOutput)
 			if len(clipboardContent) > 0 {
-				wrappedClipboard := "<user-clipboard-content>\n" + clipboardContent + "\n</user-clipboard-content>"
+				contextBuilder.WriteString(fmt.Sprintf("<clipboard>\n%s\n</clipboard>\n", clipboardContent))
+				hasContext = true
+			}
+		}
+	}
 
-				// Apply context ordering
-				if contextOrder == "append" {
-					if len(usermsg) > 0 {
-						usermsg += "\n\n"
-					}
-					usermsg += wrappedClipboard
-				} else { // Default is prepend
-					if len(usermsg) > 0 {
-						usermsg = wrappedClipboard + "\n\n" + usermsg
-					} else {
-						usermsg = wrappedClipboard
-					}
-				}
+	// 3. Shell History
+	if historyContext != "" {
+		// historyContext already has tags <context-user-shell-history>
+		contextBuilder.WriteString(historyContext)
+		hasContext = true
+	}
+
+	// === Construct Final Message ===
+	var usermsg string = strings.Join(args, " ")
+
+	if hasContext {
+		fullContext := fmt.Sprintf("<context>\n%s\n</context>", strings.TrimSpace(contextBuilder.String()))
+
+		if contextOrder == "append" {
+			if len(usermsg) > 0 {
+				usermsg = usermsg + "\n\n" + fullContext
+			} else {
+				usermsg = fullContext
+			}
+		} else {
+			// Default: prepend
+			if len(usermsg) > 0 {
+				usermsg = fullContext + "\n\n" + usermsg
+			} else {
+				usermsg = fullContext
 			}
 		}
 	}
@@ -1139,12 +1329,11 @@ func (t *loggingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		fmt.Printf(">>> %s: %s\n", k, v)
 	}
 
-	// Read and log the request body
-	reqBody, err := ioutil.ReadAll(req.Body)
+	reqBody, err := io.ReadAll(req.Body)
 	if err != nil {
 		return nil, err
 	}
-	req.Body = ioutil.NopCloser(bytes.NewBuffer(reqBody)) // Reset req.Body
+	req.Body = io.NopCloser(bytes.NewBuffer(reqBody))
 
 	var jsonData interface{}
 	err = json.Unmarshal(reqBody, &jsonData)
@@ -1165,13 +1354,12 @@ func (t *loggingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		fmt.Printf("<<< %s: %s\n", k, v)
 	}
 
-	// Read and log the response body
-	respBody, err := ioutil.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
-	resp.Body = ioutil.NopCloser(bytes.NewBuffer(respBody)) // Reset resp.Body
-	defer resp.Body.Close()                                 // Close the response body
+	resp.Body = io.NopCloser(bytes.NewBuffer(respBody))
+	defer resp.Body.Close()
 
 	var jsonDataResp interface{}
 	err = json.Unmarshal(respBody, &jsonDataResp)
@@ -1437,27 +1625,19 @@ func (m chatTuiState) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.shift = false
 			return m, nil
 
-		case tea.KeyCtrlS: // ctrl+E: copy
+		case tea.KeyCtrlS:
 			if len(m.llmMessages) > 0 {
 				putTextIntoClipboard(formatMessageLog(m.llmMessages, false, 0, 0, "", "", false))
 			}
 			return m, nil
 
-		case tea.KeyCtrlE: // ctrl+E: copy
-			// if m.shift {
-			// 	putTextIntoClipboard(formatMessageLog(m.llmMessages, false, 0, 0))
-			// } else {
-			// 	// Copy last message
-			// 	if len(m.llmMessages) > 0 {
-			// 		putTextIntoClipboard(m.llmMessages[len(m.llmMessages)-1].Content)
-			// 	}
-			// }
+		case tea.KeyCtrlE:
 			if len(m.llmMessages) > 0 {
 				putTextIntoClipboard(m.llmMessages[len(m.llmMessages)-1].Content)
 			}
 			return m, nil
 
-		case tea.KeyCtrlD: // ctrl+N
+		case tea.KeyCtrlD:
 			removeLastMsg(m)
 
 			m.viewport.SetContent(formatMessageLog(m.llmMessages, m.renderMarkdown, m.viewportWidth, m.mdPaddingWidth, "", "", true))
@@ -1475,24 +1655,11 @@ func (m chatTuiState) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 
-				// if len(m.llmMessages) > 0 && m.llmMessages[len(m.llmMessages)-1].Role == "user" {
-				// 	// TODO customize
-				// 	var lastmsg = m.llmMessages[len(m.llmMessages)-1]
-				// 	var content = "# Input context:\n" + lastmsg.Content + "\n" + "# User query:\n" +
-
-				// }
-
 				ret, cmds := sendMsg(m, usermsg)
 
 				return ret, tea.Batch(tiCmd, vpCmd, spCmd, cmds)
 			}
 		}
-
-		// case tea.KeyBackspace:
-		// 	if len(m.textarea.Value()) > 0 {
-		// 		m.textarea.SetValue(m.textarea.Value()[:len(m.textarea.Value())-1])
-		// 	}
-		// }
 
 	case tea.WindowSizeMsg:
 		m.textarea.SetWidth(msg.Width - 2)

@@ -199,3 +199,82 @@ func trimHistoryFile(path string, maxEntries int) error {
 
 	return nil
 }
+
+// readShellHistory reads the last N commands from the shell's history file
+func readShellHistory(shell ShellInfo, maxLines int) ([]string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+
+	var historyPath string
+	switch shell.Name {
+	case "zsh":
+		historyPath = filepath.Join(home, ".zsh_history")
+		if envHist := os.Getenv("HISTFILE"); envHist != "" {
+			historyPath = envHist
+		}
+	case "bash":
+		historyPath = filepath.Join(home, ".bash_history")
+		if envHist := os.Getenv("HISTFILE"); envHist != "" {
+			historyPath = envHist
+		}
+	case "fish":
+		historyPath = filepath.Join(home, ".local/share/fish/fish_history")
+	default:
+		return nil, fmt.Errorf("unsupported shell for history: %s", shell.Name)
+	}
+
+	contentBytes, err := os.ReadFile(historyPath)
+	if err != nil {
+		return nil, err
+	}
+	content := string(contentBytes)
+	lines := strings.Split(content, "\n")
+
+	var commands []string
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		var cmd string
+		if shell.Name == "zsh" {
+			// Format: : timestamp:0;command
+			// We look for the first semicolon
+			parts := strings.SplitN(line, ";", 2)
+			if len(parts) == 2 {
+				cmd = parts[1]
+			} else {
+				// Fallback for unformatted lines
+				cmd = line
+			}
+		} else if shell.Name == "fish" {
+			// Format: - cmd: command
+			if strings.HasPrefix(line, "- cmd: ") {
+				cmd = strings.TrimPrefix(line, "- cmd: ")
+			} else {
+				continue // Skip other metadata lines like '  when: ...'
+			}
+		} else {
+			// Bash and others: raw command
+			cmd = line
+		}
+
+		// Ignore commands starting with space
+		if strings.HasPrefix(cmd, " ") {
+			continue
+		}
+
+		commands = append(commands, cmd)
+	}
+
+	// Take last N
+	if len(commands) > maxLines {
+		commands = commands[len(commands)-maxLines:]
+	}
+
+	return commands, nil
+}

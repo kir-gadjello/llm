@@ -1,6 +1,8 @@
 module github.com/kir-gadjello/llm
 
-go 1.22.2
+go 1.24.0
+
+toolchain go1.24.10
 
 require github.com/spf13/cobra v1.8.0
 
@@ -21,6 +23,7 @@ require (
 	github.com/alecthomas/chroma v0.10.0 // indirect
 	github.com/atotto/clipboard v0.1.4 // indirect
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
+	github.com/creack/pty v1.1.24 // indirect
 	github.com/disintegration/imaging v1.6.2 // indirect
 	github.com/dlclark/regexp2 v1.10.0 // indirect
 	github.com/eliukblau/pixterm v1.3.1 // indirect
@@ -42,8 +45,8 @@ require (
 	golang.org/x/image v0.15.0 // indirect
 	golang.org/x/net v0.21.0 // indirect
 	golang.org/x/sync v0.7.0 // indirect
-	golang.org/x/sys v0.20.0 // indirect
-	golang.org/x/term v0.20.0 // indirect
+	golang.org/x/sys v0.38.0 // indirect
+	golang.org/x/term v0.37.0 // indirect
 	golang.org/x/text v0.14.0 // indirect
 
 )

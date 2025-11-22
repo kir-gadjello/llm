@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"strings"
@@ -41,18 +42,26 @@ Environment Context:
 		}
 	}
 
+	// Resolve configuration to handle model aliases
+	runCfg, err := getRunConfig(cmd, cfg, modelname)
+	if err != nil {
+		log.Printf("Warning: failed to resolve config: %v", err)
+	}
+
+	// Apply resolved config
+	modelname = runCfg.ModelName
+	apiKey := runCfg.ApiKey
+	apiBase := runCfg.ApiBase
+	temperature := runCfg.Temperature
+	seed := runCfg.Seed
+	maxTokens := runCfg.MaxTokens
+
 	// We need to construct the messages
 	messages := []LLMMessage{
 		{Role: "system", Content: systemPrompt},
 		{Role: "user", Content: userRequest},
 	}
 
-	// Common parameters
-	apiKey, _ := cmd.Flags().GetString("api-key")
-	apiBase, _ := cmd.Flags().GetString("api-base")
-	temperature, _ := cmd.Flags().GetFloat64("temperature")
-	seed, _ := cmd.Flags().GetInt("seed")
-	maxTokens, _ := cmd.Flags().GetInt("max_tokens")
 	// For shell assistant, we probably don't want streaming for the command generation itself if we want to parse it easily,
 	// but the user might want to see it being generated.
 	// However, the requirement says "parse the llm output and find first markdown block".
@@ -71,6 +80,10 @@ Environment Context:
 	llmCallStartTime := time.Now()
 	extra := map[string]interface{}{
 		"max_tokens": maxTokens,
+	}
+	// Merge ExtraBody from config
+	for k, v := range runCfg.ExtraBody {
+		extra[k] = v
 	}
 	ch, err := llmChat(messages, modelname, seed, temperature, nil, apiKey, apiBase, false, extra, verbose)
 	if err != nil {
@@ -220,16 +233,31 @@ func interactiveShellMenu(shell ShellInfo, command string, originalRequest strin
 				{Role: "user", Content: explainPrompt},
 			}
 
-			// Use streaming for description
-			apiKey, _ := cmd.Flags().GetString("api-key")
-			apiBase, _ := cmd.Flags().GetString("api-base")
+			// Resolve model configuration
 			modelname, _ := cmd.Flags().GetString("model")
-			if modelname == "" && cfg.Default != "" {
-				modelname = cfg.Default
+			if modelname == "" {
+				if cfg.Default != "" {
+					modelname = cfg.Default
+				}
+			}
+
+			runCfg, err := getRunConfig(cmd, cfg, modelname)
+			if err != nil {
+				fmt.Printf("Warning: failed to resolve config: %v\n", err)
+			}
+
+			// Apply resolved config
+			modelname = runCfg.ModelName
+			apiKey := runCfg.ApiKey
+			apiBase := runCfg.ApiBase
+
+			extra := map[string]interface{}{}
+			for k, v := range runCfg.ExtraBody {
+				extra[k] = v
 			}
 
 			fmt.Println(dimColor.Render("Explanation:"))
-			ch, err := llmChat(messages, modelname, 0, 0.7, nil, apiKey, apiBase, true, nil, false)
+			ch, err := llmChat(messages, modelname, 0, 0.7, nil, apiKey, apiBase, true, extra, false)
 			if err != nil {
 				fmt.Printf("Error getting description: %v\n", err)
 				continue

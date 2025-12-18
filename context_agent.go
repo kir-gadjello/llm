@@ -83,8 +83,10 @@ Return the list of relevant file paths:`, repoMap, query)
 
 	// Read response
 	var response string
-	for chunk := range ch {
-		response += chunk
+	for event := range ch {
+		if event.Type == "content" {
+			response += event.Content
+		}
 	}
 
 	response = strings.TrimSpace(response)

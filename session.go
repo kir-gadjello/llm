@@ -533,10 +533,12 @@ func runInlineLLM(cmd *cobra.Command, cfg *ConfigFile, query string, historyStr 
 	}
 
 	// 6. Stream output with \r\n fix for Raw Mode
-	for chunk := range ch {
-		// Raw mode requires \r\n for newlines, otherwise cursor just drops down without moving left
-		chunk = strings.ReplaceAll(chunk, "\n", "\r\n")
-		fmt.Print(chunk)
+	for event := range ch {
+		if event.Type == "content" {
+			// Raw mode requires \r\n for newlines, otherwise cursor just drops down without moving left
+			chunk := strings.ReplaceAll(event.Content, "\n", "\r\n")
+			fmt.Print(chunk)
+		}
 	}
 	fmt.Print("\r\n")
 

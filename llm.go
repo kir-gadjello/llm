@@ -62,6 +62,11 @@ func displayTimings(t Timings) {
 	fmt.Fprintf(os.Stderr, "==========================\n")
 }
 
+type StreamEvent struct {
+	Type    string // "content" or "reasoning"
+	Content string
+}
+
 type LLMChatRequestBasic struct {
 	Model       string                 `json:"model"`
 	Seed        int                    `json:"seed"`
@@ -146,7 +151,7 @@ func llmChat(
 	stream bool,
 	extra map[string]interface{},
 	verbose bool,
-) (<-chan string, error) {
+) (<-chan StreamEvent, error) {
 	apiKey, apiBase, err := resolveLLMApi(apiKey, apiBase)
 	if err != nil {
 		log.Fatal(err)
@@ -226,7 +231,7 @@ func llmChat(
 			return nil, fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
 		}
 
-		ch := make(chan string)
+		ch := make(chan StreamEvent)
 
 		go func() {
 			scanner := bufio.NewScanner(resp.Body)
@@ -254,7 +259,8 @@ func llmChat(
 					var resp struct {
 						Choices []struct {
 							Delta struct {
-								Content string `json:"content"`
+								Content   string `json:"content"`
+								Reasoning string `json:"reasoning"`
 							} `json:"delta"`
 							FinishReason *string `json:"finish_reason"`
 							Index        int     `json:"index"`
@@ -277,20 +283,20 @@ func llmChat(
 						continue
 					}
 
-					if len(resp.Choices) > 0 && resp.Choices[0].Delta.Content != "" {
-						content := resp.Choices[0].Delta.Content
-						if postprocess != nil {
-							content = postprocess(content)
+					if len(resp.Choices) > 0 {
+						if resp.Choices[0].Delta.Reasoning != "" {
+							ch <- StreamEvent{Type: "reasoning", Content: resp.Choices[0].Delta.Reasoning}
 						}
-						ch <- content
-					} else {
-						if resp.Choices[0].FinishReason != nil && len(*resp.Choices[0].FinishReason) > 0 {
-							close(ch)
-							return
-						} else {
-							if verbose {
-								fmt.Println("Unexpected end of chat completion stream:", line)
+						if resp.Choices[0].Delta.Content != "" {
+							content := resp.Choices[0].Delta.Content
+							if postprocess != nil {
+								content = postprocess(content)
 							}
+							ch <- StreamEvent{Type: "content", Content: content}
+						}
+
+						if resp.Choices[0].FinishReason != nil && len(*resp.Choices[0].FinishReason) > 0 {
+							// close(ch) happens at end of loop
 						}
 					}
 				}
@@ -345,8 +351,8 @@ func llmChat(
 		content = postprocess(content)
 	}
 
-	ch := make(chan string, 1) // create a buffered channel with capacity 1
-	ch <- content
+	ch := make(chan StreamEvent, 1) // create a buffered channel with capacity 1
+	ch <- StreamEvent{Type: "content", Content: content}
 	close(ch)
 
 	return ch, nil
@@ -452,12 +458,16 @@ type ContextConfig struct {
 }
 
 type ConfigFile struct {
-	Default           string                 `yaml:"default,omitempty"`
-	Timeout           *int                   `yaml:"timeout,omitempty"` // Global default in seconds
-	PipedInputWrapper *string                `yaml:"piped_input_wrapper,omitempty"`
-	Models            map[string]ModelConfig `yaml:"models,omitempty"`
-	Shell             *ShellConfig           `yaml:"shell,omitempty"`
-	Context           *ContextConfig         `yaml:"context,omitempty"`
+	Default             string                 `yaml:"default,omitempty"`
+	Timeout             *int                   `yaml:"timeout,omitempty"` // Global default in seconds
+	PipedInputWrapper   *string                `yaml:"piped_input_wrapper,omitempty"`
+	LogReasoning        *bool                  `yaml:"log_reasoning,omitempty"`
+	LogReasoningShorten *int                   `yaml:"log_reasoning_shorten,omitempty"`
+	ThinkingStartTag    *string                `yaml:"thinking_start_tag,omitempty"`
+	ThinkingEndTag      *string                `yaml:"thinking_end_tag,omitempty"`
+	Models              map[string]ModelConfig `yaml:"models,omitempty"`
+	Shell               *ShellConfig           `yaml:"shell,omitempty"`
+	Context             *ContextConfig         `yaml:"context,omitempty"`
 }
 
 func loadConfig() (*ConfigFile, error) {
@@ -1010,7 +1020,7 @@ func main() {
 			if historyMgr == nil {
 				return fmt.Errorf("history manager not initialized")
 			}
-			
+
 			// Resolve UUID
 			partial := args[0]
 			uuid, err := historyMgr.ResolveSessionUUID(partial)
@@ -1068,7 +1078,7 @@ func main() {
 
 			resumedMessages = llmMsgs
 			resumedSessionUUID = uuid
-			
+
 			return runLLMChat(cmd, nextPrompt)
 		},
 	}
@@ -1690,7 +1700,7 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), runCfg.Timeout)
 	defer cancel()
 
-	llmApiFunc := func(messages []Message) (<-chan string, error) {
+	llmApiFunc := func(messages []Message) (<-chan StreamEvent, error) {
 		filteredMessages := make([]LLMMessage, len(messages))
 		for i, msg := range messages {
 			filteredMessages[i] = LLMMessage{
@@ -1759,12 +1769,74 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	}
 
 	firstChunk := true
-	for content := range ch {
+
+	// Reasoning UI state
+	logReasoning := true
+	if cfg.LogReasoning != nil {
+		logReasoning = *cfg.LogReasoning
+	}
+	shorten := -1
+	if cfg.LogReasoningShorten != nil {
+		shorten = *cfg.LogReasoningShorten
+	}
+
+	thinkingStart := "\033[32m<thinking>\033[0m\n"
+	if cfg.ThinkingStartTag != nil {
+		thinkingStart = *cfg.ThinkingStartTag
+	}
+	thinkingEnd := "\n\033[32m</thinking>\033[0m\n"
+	if cfg.ThinkingEndTag != nil {
+		thinkingEnd = *cfg.ThinkingEndTag
+	}
+
+	var reasoningBuffer string
+	var displayedLines int
+	var thinkingPrinted bool
+	var reasoningDone bool
+
+	for event := range ch {
 		if debug && firstChunk {
 			timings.TimeToFirstChunk = time.Since(startTime)
 			firstChunk = false
 		}
-		fmt.Print(content)
+
+		if event.Type == "reasoning" {
+			if !logReasoning {
+				continue
+			}
+			if !thinkingPrinted {
+				fmt.Print(thinkingStart)
+				thinkingPrinted = true
+			}
+			if shorten > 0 {
+				reasoningBuffer += event.Content
+				lines := strings.Split(strings.TrimRight(reasoningBuffer, "\n"), "\n")
+
+				start := 0
+				if len(lines) > shorten {
+					start = len(lines) - shorten
+				}
+				toDisplay := lines[start:]
+
+				if displayedLines > 0 {
+					fmt.Printf("\033[%dA", displayedLines) // Move up
+					fmt.Printf("\033[J")                   // Clear down
+				}
+
+				for _, line := range toDisplay {
+					fmt.Println(line)
+				}
+				displayedLines = len(toDisplay)
+			} else {
+				fmt.Print(event.Content)
+			}
+		} else if event.Type == "content" {
+			if logReasoning && thinkingPrinted && !reasoningDone {
+				fmt.Print(thinkingEnd)
+				reasoningDone = true
+			}
+			fmt.Print(event.Content)
+		}
 	}
 
 	if debug {
@@ -1834,10 +1906,10 @@ type chatTuiState struct {
 	viewport       viewport.Model
 	textarea       textarea.Model
 	llmMessages    []Message
-	llmApi         func(messages []Message) (<-chan string, error)
+	llmApi         func(messages []Message) (<-chan StreamEvent, error)
 	historyApi     func(Message) error
 	session        Session
-	ch             <-chan string
+	ch             <-chan StreamEvent
 	err            error
 	renderMarkdown bool
 	viewportWidth  int
@@ -1865,7 +1937,7 @@ func getLastMsg(m chatTuiState) (Message, error) {
 	return m.llmMessages[len(m.llmMessages)-1], nil
 }
 
-func initialModel(session Session, messages []Message, llmHistoryApi func(Message) error, llmApi func(messages []Message) (<-chan string, error), initialTextareaValue string, sendRightAway bool) chatTuiState {
+func initialModel(session Session, messages []Message, llmHistoryApi func(Message) error, llmApi func(messages []Message) (<-chan StreamEvent, error), initialTextareaValue string, sendRightAway bool) chatTuiState {
 	ta := textarea.New()
 	ta.Placeholder = "Type a message..."
 	ta.Focus()
@@ -2258,10 +2330,12 @@ func (m chatTuiState) View() string {
 	) + "\n"
 }
 
-func readLLMResponse(m chatTuiState, ch <-chan string) tea.Cmd {
+func readLLMResponse(m chatTuiState, ch <-chan StreamEvent) tea.Cmd {
 	return func() tea.Msg {
-		for content := range ch {
-			return updateViewportMsg{content: content, streaming: true}
+		for event := range ch {
+			if event.Type == "content" {
+				return updateViewportMsg{content: event.Content, streaming: true}
+			}
 		}
 		var lastMsg, err = getLastMsg(m)
 		if err == nil {

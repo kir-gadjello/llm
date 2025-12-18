@@ -115,12 +115,14 @@ Environment Context:
 
 	var fullResponse strings.Builder
 	firstChunk := true
-	for chunk := range ch {
-		if debug && firstChunk {
-			timings.TimeToFirstChunk = time.Since(startTime)
-			firstChunk = false
+	for event := range ch {
+		if event.Type == "content" {
+			if debug && firstChunk {
+				timings.TimeToFirstChunk = time.Since(startTime)
+				firstChunk = false
+			}
+			fullResponse.WriteString(event.Content)
 		}
-		fullResponse.WriteString(chunk)
 	}
 
 	if debug {
@@ -282,8 +284,10 @@ func interactiveShellMenu(shell ShellInfo, command string, originalRequest strin
 				continue
 			}
 
-			for chunk := range ch {
-				fmt.Print(chunk)
+			for event := range ch {
+				if event.Type == "content" {
+					fmt.Print(event.Content)
+				}
 			}
 			fmt.Println()
 			fmt.Println()

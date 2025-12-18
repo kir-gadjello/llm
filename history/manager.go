@@ -91,6 +91,7 @@ func (m *Manager) migrate() {
 		// Determine type loosely
 		var base map[string]interface{}
 		if err := json.Unmarshal(line, &base); err != nil {
+			fmt.Fprintf(os.Stderr, "Error parsing history line during migration: %v\n", err)
 			continue
 		}
 

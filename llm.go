@@ -996,9 +996,28 @@ func main() {
 				return fmt.Errorf("session not found or empty")
 			}
 
-			// Reconstruct messages
+			// Reconstruct messages handling removals
 			var llmMsgs []Message
 			for _, m := range msgs {
+				if m.Role == "__sys__" {
+					var sysOp map[string]string
+					if err := json.Unmarshal([]byte(m.Content), &sysOp); err == nil {
+						if sysOp["sysop"] == "remove_msg" {
+							targetID := sysOp["id"]
+							// Remove from llmMsgs
+							n := 0
+							for _, active := range llmMsgs {
+								if active.UUID != targetID {
+									llmMsgs[n] = active
+									n++
+								}
+							}
+							llmMsgs = llmMsgs[:n]
+						}
+					}
+					continue
+				}
+
 				llmMsgs = append(llmMsgs, Message{
 					Role:    m.Role,
 					Content: m.Content,
@@ -1023,6 +1042,7 @@ func main() {
 			return runLLMChat(cmd, nextPrompt)
 		},
 	}
+	resumeCmd.Flags().AddFlagSet(rootCmd.Flags())
 	rootCmd.AddCommand(resumeCmd)
 
 	// Initialize History Manager
@@ -1186,6 +1206,7 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 				cmd = strings.ReplaceAll(cmd, "&", "&amp;")
 				cmd = strings.ReplaceAll(cmd, "<", "&lt;")
 				cmd = strings.ReplaceAll(cmd, ">", "&gt;")
+				cmd = strings.ReplaceAll(cmd, "\"", "&quot;")
 
 				attrs := ""
 				if idx == 0 {
@@ -1880,7 +1901,11 @@ func removeLastMsg(m chatTuiState) error {
 			break
 		}
 
-		pseudoMsg := NewMessage("__sys__", fmt.Sprintf(`{"sysop": "remove_msg", "id": "%s"}`, lastMsg))
+		payload, _ := json.Marshal(map[string]string{
+			"sysop": "remove_msg",
+			"id":    lastMsg.UUID,
+		})
+		pseudoMsg := NewMessage("__sys__", string(payload))
 		m.historyApi(*pseudoMsg)
 
 		m.llmMessages = m.llmMessages[:len(m.llmMessages)-1]
@@ -1892,7 +1917,11 @@ func removeLastMsg(m chatTuiState) error {
 			return err
 		}
 
-		pseudoMsg := NewMessage("__sys__", fmt.Sprintf(`{"sysop": "remove_msg", "id": "%s"}`, lastMsg.UUID))
+		payload, _ := json.Marshal(map[string]string{
+			"sysop": "remove_msg",
+			"id":    lastMsg.UUID,
+		})
+		pseudoMsg := NewMessage("__sys__", string(payload))
 		m.historyApi(*pseudoMsg)
 
 		m.llmMessages = m.llmMessages[:len(m.llmMessages)-1]

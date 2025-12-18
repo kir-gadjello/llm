@@ -436,6 +436,7 @@ type ModelConfig struct {
 	ContextOrder       *string                `yaml:"context_order,omitempty"`
 	ExtraBody          map[string]interface{} `yaml:"extra_body,omitempty"`
 	Extend             *string                `yaml:"extend,omitempty"`
+	Aliases            []string               `yaml:"aliases,omitempty"`
 }
 
 type ShellConfig struct {
@@ -504,6 +505,35 @@ func loadConfig() (*ConfigFile, error) {
 	err = yaml.Unmarshal(data, &cfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse config file %s: %w", configPath, err)
+	}
+
+	// Expand aliases
+	if cfg.Models != nil {
+		aliasMap := make(map[string]ModelConfig)
+		for name, config := range cfg.Models {
+			for _, alias := range config.Aliases {
+				// Check against main keys
+				if _, exists := cfg.Models[alias]; exists {
+					fmt.Fprintf(os.Stderr, "Warning: alias '%s' defined in model '%s' clashes with existing model. Ignoring alias.\n", alias, name)
+					continue
+				}
+				// Check against other aliases found so far
+				if _, exists := aliasMap[alias]; exists {
+					fmt.Fprintf(os.Stderr, "Warning: duplicate alias '%s' defined in model '%s'. Ignoring.\n", alias, name)
+					continue
+				}
+
+				// Create an alias entry that extends the original model
+				parentName := name
+				aliasMap[alias] = ModelConfig{
+					Extend: &parentName,
+				}
+			}
+		}
+		// Merge aliases
+		for k, v := range aliasMap {
+			cfg.Models[k] = v
+		}
 	}
 
 	// Ensure directory structure exists (but don't fail if we can't create)

@@ -10,7 +10,7 @@ type SessionStartEvent struct {
 	SystemPrompt       string      `json:"system_prompt"`
 	Model              string      `json:"model"`
 	Seed               int         `json:"seed"`
-	Temperature        float64     `json:"temperature"`
+	Temperature        *float64    `json:"temperature,omitempty"`
 	APIBase            string      `json:"api_base"`
 	MaxTokens          int         `json:"max_tokens"`
 	JSONMode           bool        `json:"json_mode"`

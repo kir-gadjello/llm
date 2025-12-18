@@ -125,6 +125,12 @@ func TestCLI(t *testing.T) {
 			Want: `"temperature":1.5`,
 		},
 		{
+			Name:     "Temperature Omitted",
+			Args:     []string{"hi"},
+			Want:     `"model"`,
+			WantMiss: `"temperature"`,
+		},
+		{
 			Name: "System Prompt",
 			Args: []string{"-p", "act like a pirate", "hi"},
 			Want: `"content":"act like a pirate"`,
@@ -135,9 +141,9 @@ func TestCLI(t *testing.T) {
 			Want: `"max_tokens":123`,
 		},
 		{
-			Name: "Max Tokens Omitted",
-			Args: []string{"hi"},
-			Want: `"model"`, // Ensure request was made
+			Name:     "Max Tokens Omitted",
+			Args:     []string{"hi"},
+			Want:     `"model"`, // Ensure request was made
 			WantMiss: `"max_tokens"`,
 		},
 		{

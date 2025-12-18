@@ -103,12 +103,13 @@ func TestAPIRequestConstruction(t *testing.T) {
 			}
 
 			// Execute
+			temp := 0.7
 			_, err := llmChat(
 				context.Background(),
 				messages,
 				tc.model,
 				0,   // seed
-				0.7, // temp
+				&temp, // temp
 				nil, // postprocess
 				"sk-test-key",
 				server.URL, // Point to mock server

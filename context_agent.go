@@ -60,12 +60,13 @@ Return the list of relevant file paths:`, repoMap, query)
 	}
 
 	// Call LLM (non-streaming)
+	zeroTemp := 0.0
 	ch, err := llmChat(
 		context.Background(),
 		messages,
 		selectorModel,
 		42,  // seed
-		0.0, // temperature (deterministic)
+		&zeroTemp, // temperature (deterministic)
 		nil, // no postprocess
 		apiKey,
 		apiBase,

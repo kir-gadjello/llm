@@ -19,7 +19,7 @@ func TestLLMChat_ErrorHandling(t *testing.T) {
 
 		messages := []LLMMessage{{Role: "user", Content: "hello"}}
 		// Use the mock server URL as apiBase
-		_, err := llmChat(context.Background(), messages, "test-model", 0, 0, nil, "test-key", server.URL, false, nil, false)
+		_, err := llmChat(context.Background(), messages, "test-model", 0, nil, nil, "test-key", server.URL, false, nil, false)
 
 		if err == nil {
 			t.Fatal("Expected error for 500 response, got nil")
@@ -39,7 +39,7 @@ func TestLLMChat_ErrorHandling(t *testing.T) {
 		defer server.Close()
 
 		messages := []LLMMessage{{Role: "user", Content: "hello"}}
-		_, err := llmChat(context.Background(), messages, "test-model", 0, 0, nil, "test-key", server.URL, false, nil, false)
+		_, err := llmChat(context.Background(), messages, "test-model", 0, nil, nil, "test-key", server.URL, false, nil, false)
 
 		if err == nil {
 			t.Fatal("Expected error for empty choices, got nil")

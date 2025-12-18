@@ -279,7 +279,8 @@ func interactiveShellMenu(shell ShellInfo, command string, originalRequest strin
 			}
 
 			fmt.Println(dimColor.Render("Explanation:"))
-			ch, err := llmChat(context.Background(), messages, modelname, 0, 0.7, nil, apiKey, apiBase, true, extra, false)
+			temp := 0.7
+			ch, err := llmChat(context.Background(), messages, modelname, 0, &temp, nil, apiKey, apiBase, true, extra, false)
 			if err != nil {
 				fmt.Printf("Error getting description: %v\n", err)
 				continue

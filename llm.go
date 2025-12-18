@@ -70,7 +70,7 @@ type StreamEvent struct {
 type LLMChatRequestBasic struct {
 	Model       string                 `json:"model"`
 	Seed        int                    `json:"seed"`
-	Temperature float64                `json:"temperature"`
+	Temperature *float64               `json:"temperature,omitempty"`
 	Stream      bool                   `json:"stream"`
 	Messages    []LLMMessage           `json:"messages"`
 	Extra       map[string]interface{} `json:"-"`
@@ -144,7 +144,7 @@ func llmChat(
 	messages []LLMMessage,
 	model string,
 	seed int,
-	temperature float64,
+	temperature *float64,
 	postprocess func(string) string,
 	apiKey string,
 	apiBase string,
@@ -679,7 +679,7 @@ type RunConfig struct {
 	ModelName          string
 	ApiKey             string
 	ApiBase            string
-	Temperature        float64
+	Temperature        *float64
 	Timeout            time.Duration
 	Seed               int
 	MaxTokens          int
@@ -695,7 +695,13 @@ func getRunConfig(cmd *cobra.Command, cfg *ConfigFile, modelname string) (RunCon
 	// 1. Initial values from flags (defaults or user-provided)
 	apiKey, _ := cmd.Flags().GetString("api-key")
 	apiBase, _ := cmd.Flags().GetString("api-base")
-	temperature, _ := cmd.Flags().GetFloat64("temperature")
+	
+	var temperature *float64
+	if cmd.Flags().Changed("temperature") {
+		t, _ := cmd.Flags().GetFloat64("temperature")
+		temperature = &t
+	}
+	
 	timeoutSec, _ := cmd.Flags().GetInt("timeout")
 	seed, _ := cmd.Flags().GetInt("seed")
 	maxTokens, _ := cmd.Flags().GetInt("max_tokens")
@@ -756,7 +762,7 @@ func getRunConfig(cmd *cobra.Command, cfg *ConfigFile, modelname string) (RunCon
 				apiBase = *resolvedCfg.ApiBase
 			}
 			if resolvedCfg.Temperature != nil && !cmd.Flags().Changed("temperature") {
-				temperature = *resolvedCfg.Temperature
+				temperature = resolvedCfg.Temperature
 			}
 			if resolvedCfg.Timeout != nil {
 				finalTimeout = *resolvedCfg.Timeout
@@ -1111,7 +1117,7 @@ func main() {
 var resumedMessages []Message
 var resumedSessionUUID string
 
-func markChatStart(session *Session, userMsg, systemPrompt, model string, seed int, temperature float64, apiBase string, maxTokens int, jsonMode bool, stopSequences interface{}, extraParams string, jsonSchema string, reasoningEffort string, reasoningMaxTokens int, reasoningExclude bool) error {
+func markChatStart(session *Session, userMsg, systemPrompt, model string, seed int, temperature *float64, apiBase string, maxTokens int, jsonMode bool, stopSequences interface{}, extraParams string, jsonSchema string, reasoningEffort string, reasoningMaxTokens int, reasoningExclude bool) error {
 	if historyMgr == nil {
 		return nil
 	}
@@ -1205,7 +1211,7 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	}
 
 	seed, _ := cmd.Flags().GetInt("seed")
-	temperature, _ := cmd.Flags().GetFloat64("temperature")
+	// temperature handled via RunConfig
 	apiKey, _ := cmd.Flags().GetString("api-key")
 	apiBase, _ := cmd.Flags().GetString("api-base")
 	stream, _ := cmd.Flags().GetBool("stream")
@@ -1288,7 +1294,7 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	modelname = runCfg.ModelName
 	apiKey = runCfg.ApiKey
 	apiBase = runCfg.ApiBase
-	temperature = runCfg.Temperature
+	temperature := runCfg.Temperature
 	seed = runCfg.Seed
 	maxTokens = runCfg.MaxTokens
 	contextOrder = runCfg.ContextOrder
@@ -1643,7 +1649,11 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 		fmt.Printf("Model:  %s\n", modelname)
 		fmt.Printf("Tokens: System: ~%d | Prompt: ~%d | Context: ~%d | Total: ~%d\n",
 			sTokens, pTokens, cTokens, sTokens+pTokens+cTokens)
-		fmt.Printf("Params: Temp: %.2f | Seed: %d | MaxTokens: %d\n", temperature, seed, maxTokens)
+		tempVal := 0.0
+		if temperature != nil {
+			tempVal = *temperature
+		}
+		fmt.Printf("Params: Temp: %.2f | Seed: %d | MaxTokens: %d\n", tempVal, seed, maxTokens)
 		if runCfg.ReasoningEffort != "" {
 			fmt.Printf("Reasoning: Effort: %s | Max: %d | Exclude: %v\n",
 				runCfg.ReasoningEffort, runCfg.ReasoningMaxTokens, runCfg.ReasoningExclude)

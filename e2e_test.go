@@ -229,7 +229,7 @@ func TestCLI(t *testing.T) {
 			Name: "Piped Input (No Wrapper)",
 			In:   "raw_data",
 			Args: []string{"-w", "", "analyze"},
-			Want: "raw_data\\n\\nanalyze", // Appended raw
+			Want: "analyze\\n\\nraw_data", // Appended raw (default append)
 		},
 		{
 			Name: "Context Order Append",

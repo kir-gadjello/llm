@@ -73,8 +73,34 @@ func NewMessage(role, content string) *Message {
 	}
 }
 
-func formatContextXML(files []FileContext, truncateLimit int) string {
+func formatContext(files []FileContext, format string, truncateLimit int) string {
 	var buf strings.Builder
+
+	if format == "md" {
+		for _, f := range files {
+			buf.WriteString(fmt.Sprintf("File: %s\n", f.Path))
+			if f.IsBinary {
+				buf.WriteString("[Binary File]\n")
+			} else {
+				content := f.Content
+				if truncateLimit > 0 {
+					lines := strings.Split(content, "\n")
+					if len(lines) > truncateLimit {
+						content = strings.Join(lines[:truncateLimit], "\n") + fmt.Sprintf("\n... [truncated %d lines] ...", len(lines)-truncateLimit)
+					}
+				}
+				buf.WriteString(fmt.Sprintf("```%s\n", f.Type))
+				buf.WriteString(content)
+				if !strings.HasSuffix(content, "\n") {
+					buf.WriteString("\n")
+				}
+				buf.WriteString("```\n")
+			}
+			buf.WriteString("\n")
+		}
+		return buf.String()
+	}
+
 	buf.WriteString("<context>\n<files>\n")
 	for _, f := range files {
 		buf.WriteString(fmt.Sprintf("<file path=\"%s\">\n", f.Path))
@@ -569,7 +595,7 @@ func main() {
 	rootCmd.Flags().BoolP("chat", "c", false, "Launch chat mode")
 	rootCmd.Flags().Bool("chat-send", false, "Launch chat mode and send the first message right away")
 	rootCmd.Flags().BoolP("clipboard", "x", false, "Paste clipboard content as <user-clipboard-content>")
-	rootCmd.Flags().String("context-order", "prepend", "Context ordering for clipboard: prepend|append")
+	rootCmd.Flags().String("context-order", "append", "Context ordering for clipboard: prepend|append")
 	rootCmd.Flags().StringP("piped-wrapper", "w", "context", "Wrapper tag for piped stdin (empty string disables wrapping)")
 	rootCmd.Flags().StringSliceP("files", "f", []string{}, "List of files and directories to include in context (supports globs and comma-separated lists)")
 	rootCmd.Flags().Bool("no-gitignore", false, "Do not ignore files matched by .gitignore")
@@ -1025,6 +1051,7 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	// === File Context Resolution ===
 	autoFlag, _ := cmd.Flags().GetBool("auto")
 	filesFlag, _ := cmd.Flags().GetStringSlice("files")
+	contextFormat, _ := cmd.Flags().GetString("context-format")
 
 	// Construct initial user message to parse for @ tokens
 	var usermsg string = strings.Join(args, " ")
@@ -1160,16 +1187,16 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 
 		if len(fileContexts) > 0 {
 			// Full context for LLM
-			xmlContext := formatContextXML(fileContexts, -1)
-			contextBuilder.WriteString(xmlContext + "\n")
+			formattedContext := formatContext(fileContexts, contextFormat, -1)
+			contextBuilder.WriteString(formattedContext + "\n")
 
 			// Truncated context for debug output
 			truncateLimit := 10 // Default 10 lines
 			if cfg.Context != nil && cfg.Context.DebugTruncateFiles != nil {
 				truncateLimit = *cfg.Context.DebugTruncateFiles
 			}
-			debugXmlContext := formatContextXML(fileContexts, truncateLimit)
-			debugContextBuilder.WriteString(debugXmlContext + "\n")
+			debugFormattedContext := formatContext(fileContexts, contextFormat, truncateLimit)
+			debugContextBuilder.WriteString(debugFormattedContext + "\n")
 
 			hasContext = true
 		}

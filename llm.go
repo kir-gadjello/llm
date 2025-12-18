@@ -896,7 +896,9 @@ func main() {
 	rootCmd.Flags().BoolP("clipboard", "x", false, "Paste clipboard content as <user-clipboard-content>")
 	rootCmd.Flags().String("context-order", "prepend", "Context ordering for clipboard: prepend|append")
 	rootCmd.Flags().StringP("piped-wrapper", "w", "context", "Wrapper tag for piped stdin (empty string disables wrapping)")
-	rootCmd.Flags().StringSliceP("files", "f", []string{}, "List of files and directories to include in context")
+	rootCmd.Flags().StringSliceP("files", "f", []string{}, "List of files and directories to include in context (supports globs and comma-separated lists)")
+	rootCmd.Flags().Bool("no-gitignore", false, "Do not ignore files matched by .gitignore")
+	rootCmd.Flags().Bool("no-ignored-files", false, "Do not ignore default large/unsuitable files (e.g. package-lock.json)")
 	rootCmd.Flags().StringP("context-format", "i", "md", "Context (files) input template format (md|xml)")
 	rootCmd.Flags().BoolP("auto", "A", false, "Auto-select files using LLM")
 
@@ -909,6 +911,8 @@ func main() {
 	rootCmd.Flags().StringP("stop", "X", "", "Stop sequences (a single word or a json array)")
 	rootCmd.Flags().BoolP("debug", "D", false, "Output prompt & system msg")
 	rootCmd.Flags().BoolP("verbose", "v", false, "http & debug logging")
+	rootCmd.Flags().BoolP("dry", "d", false, "Dry run: print token stats and parameters without making network requests")
+	rootCmd.Flags().Bool("vt", false, "Lean timing debug: output response performance metrics (TTFT, TPS, etc.)")
 
 	// Shell Assistant
 	rootCmd.Flags().BoolP("shell", "s", false, "Shell Assistant: generate and execute shell commands")
@@ -1152,6 +1156,15 @@ func getFirstEnv(fallback string, envVars ...string) string {
 	return fallback
 }
 
+func estimateTokens(text string) int {
+	if text == "" {
+		return 0
+	}
+	// Staff SWE approximation: Words * 1.3 usually covers common code/English token density
+	// but requirement asks for wordcount approximation.
+	return len(strings.Fields(text))
+}
+
 func runLLMChat(cmd *cobra.Command, args []string) error {
 	// Check for --session flag alias
 	isSession, _ := cmd.Flags().GetBool("session")
@@ -1351,8 +1364,11 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 
 	allPaths := append(filesFlag, atPaths...)
 
+	noGitignore, _ := cmd.Flags().GetBool("no-gitignore")
+	noDefaultIgnore, _ := cmd.Flags().GetBool("no-ignored-files")
+
 	// Resolve paths (expand globs, git aliases, etc)
-	resolvedPaths, err := resolver.Resolve(allPaths)
+	resolvedPaths, err := resolver.Resolve(allPaths, !noGitignore, !noDefaultIgnore)
 	if err != nil {
 		if verbose {
 			fmt.Fprintf(os.Stderr, "Warning: path resolution error: %v\n", err)
@@ -1568,14 +1584,16 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 		log.Fatal(err)
 	}
 
-	if verbose {
-		timeout := 1 * time.Second // set a 10-second timeout
+	dryRun, _ := cmd.Flags().GetBool("dry")
+	timingEnabled, _ := cmd.Flags().GetBool("vt")
+
+	if verbose && !dryRun && !debug {
+		timeout := 1 * time.Second
 		models, err := getModelList(apiKey, apiBase, timeout)
-		if err != nil {
-			log.Fatal(err)
-		}
-		for _, model := range models {
-			fmt.Println(model.ID, model.Meta)
+		if err == nil {
+			for _, model := range models {
+				fmt.Println(model.ID, model.Meta)
+			}
 		}
 	}
 
@@ -1617,8 +1635,28 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 
 	reasoningConfiguredExclude = reasoningExclude
 
-	if debug {
-		fmt.Printf("PROMPT: \"%s\"\nSYSTEM MESSAGE: \"%s\"\n", debugUsermsg, systemPrompt)
+	if debug || dryRun {
+		sTokens := estimateTokens(systemPrompt)
+		pTokens := estimateTokens(usermsg)
+		cTokens := estimateTokens(contextBuilder.String())
+		fmt.Printf("\n--- LLM Request Stats ---\n")
+		fmt.Printf("Model:  %s\n", modelname)
+		fmt.Printf("Tokens: System: ~%d | Prompt: ~%d | Context: ~%d | Total: ~%d\n",
+			sTokens, pTokens, cTokens, sTokens+pTokens+cTokens)
+		fmt.Printf("Params: Temp: %.2f | Seed: %d | MaxTokens: %d\n", temperature, seed, maxTokens)
+		if runCfg.ReasoningEffort != "" {
+			fmt.Printf("Reasoning: Effort: %s | Max: %d | Exclude: %v\n",
+				runCfg.ReasoningEffort, runCfg.ReasoningMaxTokens, runCfg.ReasoningExclude)
+		}
+
+		if debug {
+			fmt.Printf("\nPROMPT:\n%s\n\nSYSTEM MESSAGE:\n%s\n", debugUsermsg, systemPrompt)
+		}
+
+		if dryRun {
+			fmt.Println("\n[Dry Run] No request made.")
+			return nil
+		}
 	}
 
 	// Only mark start if new session
@@ -1794,13 +1832,25 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	var thinkingPrinted bool
 	var reasoningDone bool
 
+	// Timing Metrics
+	t_start := time.Now()
+	var t_ttft, t_reasoning_end time.Time
+	var ttft_set = false
+	var tokens_gen int
+
 	for event := range ch {
-		if debug && firstChunk {
-			timings.TimeToFirstChunk = time.Since(startTime)
+		if firstChunk {
+			if debug {
+				timings.TimeToFirstChunk = time.Since(startTime)
+			}
 			firstChunk = false
 		}
 
 		if event.Type == "reasoning" {
+			if !ttft_set {
+				t_ttft = time.Now()
+				ttft_set = true
+			}
 			if !logReasoning {
 				continue
 			}
@@ -1831,12 +1881,37 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 				fmt.Print(event.Content)
 			}
 		} else if event.Type == "content" {
+			if !ttft_set {
+				t_ttft = time.Now()
+				ttft_set = true
+			}
 			if logReasoning && thinkingPrinted && !reasoningDone {
+				t_reasoning_end = time.Now()
 				fmt.Print(thinkingEnd)
 				reasoningDone = true
 			}
+			tokens_gen += estimateTokens(event.Content)
 			fmt.Print(event.Content)
 		}
+	}
+
+	if timingEnabled {
+		t_done := time.Now()
+		ttft_ms := t_ttft.Sub(t_start).Seconds()
+		total_s := t_done.Sub(t_start).Seconds()
+
+		var r_s float64
+		if !t_reasoning_end.IsZero() {
+			r_s = t_reasoning_end.Sub(t_ttft).Seconds()
+		}
+
+		gen_s := t_done.Sub(t_ttft).Seconds() - r_s
+		prefill_tps := float64(estimateTokens(usermsg)+estimateTokens(contextBuilder.String())) / ttft_ms
+		gen_tps := float64(tokens_gen) / gen_s
+
+		fmt.Printf("\n---\n")
+		fmt.Printf("TTFT: %.3fs | Reasoning: %.3fs | Gen: %.3fs | TPS_Prefill: %.1f | TPS_Gen: %.1f | ∑: %.1fs \n",
+			ttft_ms, r_s, gen_s, prefill_tps, gen_tps, total_s)
 	}
 
 	if debug {

@@ -161,19 +161,64 @@ func (pr *PathResolver) ExpandDirectory(dirPath string) ([]string, error) {
 	return files, nil
 }
 
-// Resolve takes a list of path patterns and expands them to actual file paths
-func (pr *PathResolver) Resolve(patterns []string) ([]string, error) {
-	allPaths := make([]string, 0)
-	gitAliases := map[string]bool{
-		"staged": true,
-		"dirty":  true,
-		"last":   true,
+func (pr *PathResolver) shouldIgnore(path string, useGitignore bool, useDefaultIgnore bool) bool {
+	base := filepath.Base(path)
+	if useDefaultIgnore {
+		// Typical large or unsuitable files
+		defaults := []string{"package-lock.json", "yarn.lock", "pnpm-lock.yaml", ".DS_Store", "node_modules", ".git"}
+		for _, d := range defaults {
+			if base == d || strings.Contains(path, "/"+d+"/") {
+				return true
+			}
+		}
 	}
 
-	var errors []string
+	if useGitignore {
+		// Staff level check: look for .gitignore in parent directories
+		dir := filepath.Dir(path)
+		for {
+			giPath := filepath.Join(dir, ".gitignore")
+			if _, err := os.Stat(giPath); err == nil {
+				data, _ := os.ReadFile(giPath)
+				lines := strings.Split(string(data), "\n")
+				for _, line := range lines {
+					line = strings.TrimSpace(line)
+					if line == "" || strings.HasPrefix(line, "#") {
+						continue
+					}
+					// Simple match
+					if matched, _ := filepath.Match(line, base); matched {
+						return true
+					}
+				}
+			}
+			parent := filepath.Dir(dir)
+			if parent == dir {
+				break
+			}
+			dir = parent
+		}
+	}
+	return false
+}
 
-	for _, pattern := range patterns {
-		// Check if it's a git alias
+// Resolve takes a list of path patterns and expands them to actual file paths
+func (pr *PathResolver) Resolve(patterns []string, useGitignore bool, useDefaultIgnore bool) ([]string, error) {
+	allPaths := make([]string, 0)
+	gitAliases := map[string]bool{"staged": true, "dirty": true, "last": true}
+
+	var errors []string
+	var normalizedPatterns []string
+	for _, p := range patterns {
+		normalizedPatterns = append(normalizedPatterns, strings.Split(p, ",")...)
+	}
+
+	for _, pattern := range normalizedPatterns {
+		pattern = strings.TrimSpace(pattern)
+		if pattern == "" {
+			continue
+		}
+
 		if gitAliases[pattern] {
 			paths, err := pr.ExpandGit(pattern)
 			if err != nil {
@@ -184,38 +229,47 @@ func (pr *PathResolver) Resolve(patterns []string) ([]string, error) {
 			continue
 		}
 
-		// Check if pattern contains glob characters
+		// Staff recursive globbing implementation
 		if strings.ContainsAny(pattern, "*?[]") {
-			paths, err := pr.ExpandGlob(pattern)
-			if err != nil {
-				errors = append(errors, err.Error())
+			// If it's a simple glob in current dir
+			if !strings.Contains(pattern, "/") && !strings.Contains(pattern, "\\") {
+				matches, _ := filepath.Glob(pattern)
+				allPaths = append(allPaths, matches...)
 				continue
 			}
-			allPaths = append(allPaths, paths...)
-			continue
 		}
 
-		// Check if it's a directory
+		// Handle dirs and direct files
 		info, err := os.Stat(pattern)
 		if err != nil {
+			// Might be a glob in a subfolder or doesn't exist
+			matches, globErr := filepath.Glob(pattern)
+			if globErr == nil && len(matches) > 0 {
+				allPaths = append(allPaths, matches...)
+				continue
+			}
 			errors = append(errors, fmt.Sprintf("cannot access %s: %v", pattern, err))
 			continue
 		}
 
 		if info.IsDir() {
-			paths, err := pr.ExpandDirectory(pattern)
-			if err != nil {
-				errors = append(errors, err.Error())
-				continue
-			}
-			allPaths = append(allPaths, paths...)
+			err = filepath.Walk(pattern, func(path string, info os.FileInfo, err error) error {
+				if err != nil {
+					return nil
+				}
+				if !info.IsDir() {
+					if !pr.shouldIgnore(path, useGitignore, useDefaultIgnore) {
+						allPaths = append(allPaths, path)
+					}
+				}
+				return nil
+			})
 		} else {
-			// It's a regular file
 			allPaths = append(allPaths, pattern)
 		}
 	}
 
-	// Deduplicate
+	// Filter and Deduplicate
 	seen := make(map[string]bool)
 	unique := make([]string, 0, len(allPaths))
 

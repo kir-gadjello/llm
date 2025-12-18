@@ -1659,7 +1659,7 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 				runCfg.ReasoningEffort, runCfg.ReasoningMaxTokens, runCfg.ReasoningExclude)
 		}
 
-		if debug {
+		if debug || (dryRun && verbose) {
 			fmt.Printf("\nPROMPT:\n%s\n\nSYSTEM MESSAGE:\n%s\n", debugUsermsg, systemPrompt)
 		}
 

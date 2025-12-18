@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/creack/pty"
+	"github.com/kir-gadjello/llm/history"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -434,7 +436,7 @@ func (w *ParserWriter) Write(p []byte) (n int, err error) {
 	return len(p), nil
 }
 
-func runInlineLLM(cmd *cobra.Command, cfg *ConfigFile, query string, history string) {
+func runInlineLLM(cmd *cobra.Command, cfg *ConfigFile, query string, historyStr string) {
 	// 4. Extract flags (moved up to get model name)
 	modelname, _ := cmd.Flags().GetString("model")
 	if modelname == "" {
@@ -459,6 +461,7 @@ func runInlineLLM(cmd *cobra.Command, cfg *ConfigFile, query string, history str
 	temperature := runCfg.Temperature
 	seed := runCfg.Seed
 	maxTokens := runCfg.MaxTokens
+	timeout := runCfg.Timeout
 	if maxTokens == 0 {
 		maxTokens = 1024
 	}
@@ -471,7 +474,7 @@ func runInlineLLM(cmd *cobra.Command, cfg *ConfigFile, query string, history str
 		"Use the provided terminal history context to answer. Be concise. Output markdown."
 
 	// 3. Construct message
-	fullContext := fmt.Sprintf("<terminal-history>\n%s\n</terminal-history>\n\nUser Question: %s", history, query)
+	fullContext := fmt.Sprintf("<terminal-history>\n%s\n</terminal-history>\n\nUser Question: %s", historyStr, query)
 
 	messages := []LLMMessage{
 		{Role: "system", Content: systemPrompt},
@@ -521,7 +524,9 @@ func runInlineLLM(cmd *cobra.Command, cfg *ConfigFile, query string, history str
 	// Note: llmChat handles 'verbose' (HTTP logs), but those logs write to stdout/stderr.
 	// In Raw Mode, standard log/fmt might step. Ideally, we'd wrap the writer, but for -v
 	// it's acceptable if it's slightly messy since it's for debugging.
-	ch, err := llmChat(messages, modelname, seed, temperature, nil, apiKey, apiBase, true, extra, verbose)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	ch, err := llmChat(ctx, messages, modelname, seed, temperature, nil, apiKey, apiBase, true, extra, verbose)
 	if err != nil {
 		fmt.Printf("\r\nError: %v\r\n", err)
 		return
@@ -536,15 +541,12 @@ func runInlineLLM(cmd *cobra.Command, cfg *ConfigFile, query string, history str
 	fmt.Print("\r\n")
 
 	// 7. Log to history (optional)
-	ephemeralSession := newSession()
-	data := struct {
-		Type    string `json:"type"`
-		Query   string `json:"query"`
-		History string `json:"history_snippet"`
-	}{
-		Type:    "session_interception",
-		Query:   query,
-		History: history[len(history)-100:],
+	if historyMgr != nil {
+		data := history.ShellEvent{
+			Type:    "session_interception",
+			Query:   query,
+			History: historyStr,
+		}
+		historyMgr.SaveShellEvent(data)
 	}
-	_ = dumpToHistory(ephemeralSession, data)
 }

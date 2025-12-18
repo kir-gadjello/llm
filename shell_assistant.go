@@ -2,11 +2,14 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
@@ -18,6 +21,17 @@ func runShellAssistant(cmd *cobra.Command, args []string, cfg *ConfigFile) error
 	userRequest := strings.Join(args, " ")
 	if userRequest == "" {
 		return fmt.Errorf("please provide a description of the command you want to execute")
+	}
+
+	// Check for API key early
+	apiKey, _ := cmd.Flags().GetString("api-key")
+	if apiKey == "" {
+		apiKey = os.Getenv("OPENAI_API_KEY")
+	}
+
+	// If still empty after config resolution (handled in getRunConfig), show helpful error
+	if apiKey == "" {
+		return fmt.Errorf("API key required for shell assistant. Use --api-key flag, set OPENAI_API_KEY environment variable, or configure in ~/.llmterm.yaml")
 	}
 
 	shellInfo := detectShell()
@@ -50,11 +64,12 @@ Environment Context:
 
 	// Apply resolved config
 	modelname = runCfg.ModelName
-	apiKey := runCfg.ApiKey
+	apiKey = runCfg.ApiKey
 	apiBase := runCfg.ApiBase
 	temperature := runCfg.Temperature
 	seed := runCfg.Seed
 	maxTokens := runCfg.MaxTokens
+	timeout := runCfg.Timeout
 
 	// We need to construct the messages
 	messages := []LLMMessage{
@@ -85,7 +100,11 @@ Environment Context:
 	for k, v := range runCfg.ExtraBody {
 		extra[k] = v
 	}
-	ch, err := llmChat(messages, modelname, seed, temperature, nil, apiKey, apiBase, false, extra, verbose)
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	ch, err := llmChat(ctx, messages, modelname, seed, temperature, nil, apiKey, apiBase, false, extra, verbose)
 	if err != nil {
 		return err
 	}
@@ -257,7 +276,7 @@ func interactiveShellMenu(shell ShellInfo, command string, originalRequest strin
 			}
 
 			fmt.Println(dimColor.Render("Explanation:"))
-			ch, err := llmChat(messages, modelname, 0, 0.7, nil, apiKey, apiBase, true, extra, false)
+			ch, err := llmChat(context.Background(), messages, modelname, 0, 0.7, nil, apiKey, apiBase, true, extra, false)
 			if err != nil {
 				fmt.Printf("Error getting description: %v\n", err)
 				continue
@@ -292,10 +311,36 @@ func readSingleKey() (rune, error) {
 	}
 	defer term.Restore(int(os.Stdin.Fd()), oldState)
 
-	b := make([]byte, 1)
-	_, err = os.Stdin.Read(b)
-	if err != nil {
-		return 0, err
+	// Handle interrupts
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(c)
+
+	ch := make(chan struct {
+		r   rune
+		err error
+	})
+
+	go func() {
+		b := make([]byte, 1)
+		_, err := os.Stdin.Read(b)
+		if err != nil {
+			ch <- struct {
+				r   rune
+				err error
+			}{0, err}
+			return
+		}
+		ch <- struct {
+			r   rune
+			err error
+		}{rune(b[0]), nil}
+	}()
+
+	select {
+	case res := <-ch:
+		return res.r, res.err
+	case <-c:
+		return 0, fmt.Errorf("interrupted")
 	}
-	return rune(b[0]), nil
 }

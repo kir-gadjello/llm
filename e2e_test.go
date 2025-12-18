@@ -31,7 +31,7 @@ func TestMain(m *testing.M) {
 		llmBinaryPath = filepath.Join(tempDir, "llm")
 	}
 
-	cmd := exec.Command("go", "build", "-o", llmBinaryPath, ".")
+	cmd := exec.Command("go", "build", "-tags", "sqlite_fts5", "-o", llmBinaryPath, ".")
 	if output, err := cmd.CombinedOutput(); err != nil {
 		fmt.Fprintf(os.Stderr, "Build failed: %v\nOutput:\n%s\n", err, output)
 		os.Exit(1)
@@ -96,11 +96,12 @@ func MockEchoHandler() http.HandlerFunc {
 
 // Case defines a simplified test scenario
 type Case struct {
-	Name string
-	Args []string // CLI args
-	In   string   // Stdin
-	Conf string   // Optional .llmterm.yaml content
-	Want string   // Substring expected in output (which is the echoed request)
+	Name      string
+	Args      []string // CLI args
+	In        string   // Stdin
+	Conf      string   // Optional .llmterm.yaml content
+	Want      string   // Substring expected in output (which is the echoed request)
+	ExpectErr bool     // Expect command to fail
 }
 
 func TestCLI(t *testing.T) {
@@ -152,12 +153,27 @@ func TestCLI(t *testing.T) {
 		{
 			Name: "Reasoning Low",
 			Args: []string{"--reasoning-low", "think"},
-			Want: `"reasoning":{"effort":"low"}`,
+			Want: `"reasoning_effort":"low"`,
 		},
 		{
 			Name: "Reasoning High",
 			Args: []string{"--reasoning-high", "think hard"},
-			Want: `"reasoning":{"effort":"high"}`,
+			Want: `"reasoning_effort":"high"`,
+		},
+		{
+			Name: "Reasoning XHigh",
+			Args: []string{"--reasoning-xhigh", "think super hard"},
+			Want: `"reasoning_effort":"xhigh"`,
+		},
+		{
+			Name: "Reasoning Custom",
+			Args: []string{"--reasoning", "mega-brain", "think"},
+			Want: `"reasoning_effort":"mega-brain"`,
+		},
+		{
+			Name: "Verbosity High",
+			Args: []string{"--verbosity", "high", "verbose mode"},
+			Want: `"verbosity":"high"`,
 		},
 		{
 			Name: "Reasoning Max Tokens",
@@ -167,7 +183,8 @@ func TestCLI(t *testing.T) {
 		{
 			Name: "Reasoning Exclude",
 			Args: []string{"--reasoning-high", "--reasoning-exclude", "think"},
-			Want: `"reasoning":{"effort":"high","exclude":true}`,
+			// Expects flat reasoning_effort AND reasoning object with exclude
+			Want: `"reasoning":{"exclude":true},"reasoning_effort":"high"`,
 		},
 
 		// --- Advanced Features ---
@@ -229,6 +246,49 @@ models:
 			Args: []string{"-s", "-y", "list files"},
 			Want: "YOLO_SUCCESS",
 		},
+		// --- Fix Regressions ---
+		{
+			Name: "Env Var Precedence",
+			Args: []string{"hi"},
+			Want: `"content":"hi"`,
+		},
+		// --- History Search E2E ---
+		// We can't easily test sqlite FTS in this E2E harness because it shells out to the binary.
+		// We would need to ensure the binary uses a predictable history path and wait for indexing.
+		// However, we can test that the search command doesn't crash on empty/missing history.
+		{
+			Name: "Search Empty",
+			Args: []string{"search", "banana"},
+			Want: "No matches found.",
+		},
+		{
+			Name: "Seed History & Search",
+			Args: []string{"remember_this_keyword"},
+			Want: "remember_this_keyword", // Verify it ran
+		},
+		// We run these in sequence, so the previous test seeded the DB in tempHome
+		{
+			Name: "Search Found",
+			Args: []string{"search", "remember_this_keyword"},
+			Want: "remember_this_keyword", // Should appear in search results
+		},
+		{
+			Name: "Search Filter",
+			Args: []string{"search", "user:remember_this_keyword"},
+			Want: "remember_this_keyword",
+		},
+		{
+			Name:      "Resume Missing Args",
+			Args:      []string{"resume"},
+			Want:      "requires at least 1 arg",
+			ExpectErr: true,
+		},
+		{
+			Name:      "Resume Session",
+			Args:      []string{"resume", "bad-uuid"},
+			Want:      "session not found",
+			ExpectErr: true,
+		},
 	}
 
 	// 4. Execution Loop
@@ -265,8 +325,11 @@ models:
 			output := string(outputBytes)
 
 			// Assert
-			if err != nil {
+			if err != nil && !tc.ExpectErr {
 				t.Fatalf("Command failed: %v\nOutput: %s", err, output)
+			}
+			if err == nil && tc.ExpectErr {
+				t.Fatalf("Command expected to fail but succeeded\nOutput: %s", output)
 			}
 
 			if !strings.Contains(output, tc.Want) {

@@ -324,6 +324,18 @@ func (ri *RepoIndexer) GenerateRepoMap(root string) (string, error) {
 
 		// Handle code files with skeletonizer
 		if codeExts[ext] {
+			// Check size limit (1MB hard limit for indexer to avoid OOM)
+			info, err := os.Stat(path)
+			if err != nil {
+				return nil
+			}
+			if info.Size() > 1024*1024 {
+				if ri.verbose {
+					fmt.Fprintf(os.Stderr, "Skipping large file > 1MB: %s\n", path)
+				}
+				return nil
+			}
+
 			content, err := os.ReadFile(path)
 			if err != nil {
 				if ri.verbose {

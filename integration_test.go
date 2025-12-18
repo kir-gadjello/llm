@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -103,6 +104,7 @@ func TestAPIRequestConstruction(t *testing.T) {
 
 			// Execute
 			_, err := llmChat(
+				context.Background(),
 				messages,
 				tc.model,
 				0,   // seed

@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
@@ -17,16 +18,18 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/atotto/clipboard"
+	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/kir-gadjello/llm/history"
 	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
 	markdown "github.com/vlanse/go-term-markdown"
@@ -37,6 +40,7 @@ import (
 var TEXTINPUT_PLACEHOLDER = "Type a message and press Enter to send..."
 
 var startTime = time.Now()
+var historyMgr *history.Manager
 
 func is_interactive(fd uintptr) bool {
 	return isatty.IsTerminal(fd) || isatty.IsCygwinTerminal(fd)
@@ -89,12 +93,9 @@ func NewMessage(role, content string) *Message {
 }
 
 func resolveLLMApi(apiKey string, apiBase string) (string, string, error) {
+	// If apiKey is already set (from config), use it
 	if apiKey == "" {
 		apiKey = os.Getenv("OPENAI_API_KEY")
-	}
-
-	if apiKey == "" && strings.Contains(apiBase, "api.openai.com") {
-		return "", "", fmt.Errorf("must provide OpenAI API key")
 	}
 
 	url := os.Getenv("OPENAI_API_BASE")
@@ -134,6 +135,7 @@ func urlJoin(base, rel string) (string, error) {
 }
 
 func llmChat(
+	ctx context.Context,
 	messages []LLMMessage,
 	model string,
 	seed int,
@@ -207,7 +209,7 @@ func llmChat(
 
 	if stream {
 		headers.Set("Accept", "text/event-stream")
-		httpReq, err := http.NewRequest("POST", chatUrl, bytes.NewBuffer(jsonData))
+		httpReq, err := http.NewRequestWithContext(ctx, "POST", chatUrl, bytes.NewBuffer(jsonData))
 		if err != nil {
 			return nil, err
 		}
@@ -243,6 +245,11 @@ func llmChat(
 				line = strings.TrimSpace(line)
 
 				if strings.HasPrefix(line, "data: ") {
+					dataStr := strings.TrimSpace(line[6:])
+					if dataStr == "[DONE]" {
+						close(ch)
+						return
+					}
 
 					var resp struct {
 						Choices []struct {
@@ -297,7 +304,7 @@ func llmChat(
 		return ch, nil
 	}
 
-	httpReq, err := http.NewRequest("POST", chatUrl, bytes.NewBuffer(jsonData))
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", chatUrl, bytes.NewBuffer(jsonData))
 
 	if err != nil {
 		return nil, err
@@ -419,11 +426,13 @@ type ModelConfig struct {
 	ApiBase            *string                `yaml:"api_base,omitempty"`
 	ApiKey             *string                `yaml:"api_key,omitempty"`
 	Temperature        *float64               `yaml:"temperature,omitempty"`
+	Timeout            *int                   `yaml:"timeout,omitempty"` // Seconds
 	Seed               *int                   `yaml:"seed,omitempty"`
 	MaxTokens          *int                   `yaml:"max_tokens,omitempty"`
 	ReasoningEffort    *string                `yaml:"reasoning_effort,omitempty"`
 	ReasoningMaxTokens *int                   `yaml:"reasoning_max_tokens,omitempty"`
 	ReasoningExclude   *bool                  `yaml:"reasoning_exclude,omitempty"`
+	Verbosity          *string                `yaml:"verbosity,omitempty"`
 	ContextOrder       *string                `yaml:"context_order,omitempty"`
 	ExtraBody          map[string]interface{} `yaml:"extra_body,omitempty"`
 	Extend             *string                `yaml:"extend,omitempty"`
@@ -443,6 +452,7 @@ type ContextConfig struct {
 
 type ConfigFile struct {
 	Default           string                 `yaml:"default,omitempty"`
+	Timeout           *int                   `yaml:"timeout,omitempty"` // Global default in seconds
 	PipedInputWrapper *string                `yaml:"piped_input_wrapper,omitempty"`
 	Models            map[string]ModelConfig `yaml:"models,omitempty"`
 	Shell             *ShellConfig           `yaml:"shell,omitempty"`
@@ -452,14 +462,12 @@ type ConfigFile struct {
 func loadConfig() (*ConfigFile, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return nil, err
+		// Don't fail completely if we can't get home dir
+		return &ConfigFile{}, nil
 	}
 
-	// New config location
 	configDir := filepath.Join(home, ".llmterm")
 	configPath := filepath.Join(configDir, "config.yaml")
-
-	// Old config location (for backward compatibility)
 	oldConfigPath := filepath.Join(home, ".llmterm.yaml")
 
 	// Try new location first
@@ -472,39 +480,36 @@ func loadConfig() (*ConfigFile, error) {
 				if errors.Is(err, os.ErrNotExist) {
 					// No config file exists, create directory structure and return empty config
 					if err := os.MkdirAll(configDir, 0o755); err != nil {
-						return nil, fmt.Errorf("failed to create config directory: %w", err)
+						// Don't fail if we can't create directory
+						return &ConfigFile{}, nil
 					}
 					// Also create cache directory
 					cacheDir := filepath.Join(configDir, "cache")
-					if err := os.MkdirAll(cacheDir, 0o755); err != nil {
-						return nil, fmt.Errorf("failed to create cache directory: %w", err)
-					}
+					os.MkdirAll(cacheDir, 0o755) // Ignore error
 					return &ConfigFile{}, nil
 				}
-				return nil, err
+				// Can't read existing config, but don't fail the program
+				return &ConfigFile{}, nil
 			}
 			// Found old config, use it but warn user
 			fmt.Fprintf(os.Stderr, "Note: Using config from %s. Consider moving it to %s\n",
 				oldConfigPath, configPath)
 		} else {
-			return nil, err
+			// Can't read config, but don't fail the program
+			return &ConfigFile{}, nil
 		}
 	}
 
 	var cfg ConfigFile
 	err = yaml.Unmarshal(data, &cfg)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse config: %w", err)
+		return nil, fmt.Errorf("failed to parse config file %s: %w", configPath, err)
 	}
 
-	// Ensure directory structure exists
-	if err := os.MkdirAll(configDir, 0o755); err != nil {
-		return nil, fmt.Errorf("failed to create config directory: %w", err)
-	}
+	// Ensure directory structure exists (but don't fail if we can't create)
+	os.MkdirAll(configDir, 0o755)
 	cacheDir := filepath.Join(configDir, "cache")
-	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
-		return nil, fmt.Errorf("failed to create cache directory: %w", err)
-	}
+	os.MkdirAll(cacheDir, 0o755)
 
 	return &cfg, nil
 }
@@ -539,13 +544,25 @@ func mergeMaps(base, override map[string]interface{}) map[string]interface{} {
 }
 
 func resolveModelConfig(cfg *ConfigFile, modelName string) (ModelConfig, error) {
-	// Basic cycle detection could be added here if needed, but for now we'll trust the user
-	// or hit a stack overflow if they make a loop.
-	// To be safer, we can use a visited map.
+	// Handle empty config
+	if cfg == nil || cfg.Models == nil || len(cfg.Models) == 0 {
+		return ModelConfig{}, nil
+	}
+
+	// Early return for empty model name
+	if modelName == "" {
+		return ModelConfig{}, nil
+	}
+
 	return resolveModelConfigRec(cfg, modelName, map[string]bool{})
 }
 
 func resolveModelConfigRec(cfg *ConfigFile, modelName string, visited map[string]bool) (ModelConfig, error) {
+	// Early return for empty model name
+	if modelName == "" {
+		return ModelConfig{}, nil
+	}
+
 	if visited[modelName] {
 		return ModelConfig{}, fmt.Errorf("circular dependency detected for model: %s", modelName)
 	}
@@ -580,6 +597,9 @@ func resolveModelConfigRec(cfg *ConfigFile, modelName string, visited map[string
 		if modelCfg.Temperature != nil {
 			merged.Temperature = modelCfg.Temperature
 		}
+		if modelCfg.Timeout != nil {
+			merged.Timeout = modelCfg.Timeout
+		}
 		if modelCfg.Seed != nil {
 			merged.Seed = modelCfg.Seed
 		}
@@ -594,6 +614,9 @@ func resolveModelConfigRec(cfg *ConfigFile, modelName string, visited map[string
 		}
 		if modelCfg.ReasoningExclude != nil {
 			merged.ReasoningExclude = modelCfg.ReasoningExclude
+		}
+		if modelCfg.Verbosity != nil {
+			merged.Verbosity = modelCfg.Verbosity
 		}
 		if modelCfg.ContextOrder != nil {
 			merged.ContextOrder = modelCfg.ContextOrder
@@ -617,11 +640,13 @@ type RunConfig struct {
 	ApiKey             string
 	ApiBase            string
 	Temperature        float64
+	Timeout            time.Duration
 	Seed               int
 	MaxTokens          int
 	ReasoningEffort    string
 	ReasoningMaxTokens int
 	ReasoningExclude   bool
+	Verbosity          string
 	ContextOrder       string
 	ExtraBody          map[string]interface{}
 }
@@ -631,20 +656,29 @@ func getRunConfig(cmd *cobra.Command, cfg *ConfigFile, modelname string) (RunCon
 	apiKey, _ := cmd.Flags().GetString("api-key")
 	apiBase, _ := cmd.Flags().GetString("api-base")
 	temperature, _ := cmd.Flags().GetFloat64("temperature")
+	timeoutSec, _ := cmd.Flags().GetInt("timeout")
 	seed, _ := cmd.Flags().GetInt("seed")
 	maxTokens, _ := cmd.Flags().GetInt("max_tokens")
 	contextOrder, _ := cmd.Flags().GetString("context-order")
 
 	// Reasoning flags
+	reasoningArg, _ := cmd.Flags().GetString("reasoning")
 	noReasoning, _ := cmd.Flags().GetBool("no-reasoning")
 	reasoningLow, _ := cmd.Flags().GetBool("reasoning-low")
 	reasoningMedium, _ := cmd.Flags().GetBool("reasoning-medium")
 	reasoningHigh, _ := cmd.Flags().GetBool("reasoning-high")
+	reasoningXHigh, _ := cmd.Flags().GetBool("reasoning-xhigh")
 	reasoningMax, _ := cmd.Flags().GetInt("reasoning-max")
 	reasoningExclude, _ := cmd.Flags().GetBool("reasoning-exclude")
 
+	// Verbosity
+	verbosity, _ := cmd.Flags().GetString("verbosity")
+
 	reasoningEffort := ""
-	if noReasoning {
+
+	if reasoningArg != "" {
+		reasoningEffort = reasoningArg
+	} else if noReasoning {
 		reasoningEffort = "none"
 	} else if reasoningLow {
 		reasoningEffort = "low"
@@ -652,11 +686,20 @@ func getRunConfig(cmd *cobra.Command, cfg *ConfigFile, modelname string) (RunCon
 		reasoningEffort = "medium"
 	} else if reasoningHigh {
 		reasoningEffort = "high"
+	} else if reasoningXHigh {
+		reasoningEffort = "xhigh"
 	}
 
 	extraBody := make(map[string]interface{})
 
 	// 2. Resolve Model Config from file
+	// Default timeout: 3000 seconds (50 minutes) if not specified anywhere
+	finalTimeout := 3000
+
+	if cfg.Timeout != nil {
+		finalTimeout = *cfg.Timeout
+	}
+
 	if len(modelname) > 0 {
 		resolvedCfg, err := resolveModelConfig(cfg, modelname)
 		if err != nil {
@@ -666,14 +709,17 @@ func getRunConfig(cmd *cobra.Command, cfg *ConfigFile, modelname string) (RunCon
 			if resolvedCfg.Model != nil {
 				modelname = *resolvedCfg.Model
 			}
-			if resolvedCfg.ApiKey != nil && !cmd.Flags().Changed("api-key") {
+			if resolvedCfg.ApiKey != nil && !cmd.Flags().Changed("api-key") && os.Getenv("OPENAI_API_KEY") == "" {
 				apiKey = *resolvedCfg.ApiKey
 			}
-			if resolvedCfg.ApiBase != nil && !cmd.Flags().Changed("api-base") {
+			if resolvedCfg.ApiBase != nil && !cmd.Flags().Changed("api-base") && os.Getenv("OPENAI_API_BASE") == "" {
 				apiBase = *resolvedCfg.ApiBase
 			}
 			if resolvedCfg.Temperature != nil && !cmd.Flags().Changed("temperature") {
 				temperature = *resolvedCfg.Temperature
+			}
+			if resolvedCfg.Timeout != nil {
+				finalTimeout = *resolvedCfg.Timeout
 			}
 			if resolvedCfg.Seed != nil && !cmd.Flags().Changed("seed") {
 				seed = *resolvedCfg.Seed
@@ -683,10 +729,12 @@ func getRunConfig(cmd *cobra.Command, cfg *ConfigFile, modelname string) (RunCon
 			}
 
 			// Apply reasoning config if not specified via flags
-			reasoningFlagsChanged := cmd.Flags().Changed("no-reasoning") ||
+			reasoningFlagsChanged := cmd.Flags().Changed("reasoning") ||
+				cmd.Flags().Changed("no-reasoning") ||
 				cmd.Flags().Changed("reasoning-low") ||
 				cmd.Flags().Changed("reasoning-medium") ||
-				cmd.Flags().Changed("reasoning-high")
+				cmd.Flags().Changed("reasoning-high") ||
+				cmd.Flags().Changed("reasoning-xhigh")
 
 			if resolvedCfg.ReasoningEffort != nil && !reasoningFlagsChanged {
 				reasoningEffort = *resolvedCfg.ReasoningEffort
@@ -696,6 +744,9 @@ func getRunConfig(cmd *cobra.Command, cfg *ConfigFile, modelname string) (RunCon
 			}
 			if resolvedCfg.ReasoningExclude != nil && !cmd.Flags().Changed("reasoning-exclude") {
 				reasoningExclude = *resolvedCfg.ReasoningExclude
+			}
+			if resolvedCfg.Verbosity != nil && !cmd.Flags().Changed("verbosity") {
+				verbosity = *resolvedCfg.Verbosity
 			}
 			if resolvedCfg.ContextOrder != nil && !cmd.Flags().Changed("context-order") {
 				contextOrder = *resolvedCfg.ContextOrder
@@ -708,58 +759,30 @@ func getRunConfig(cmd *cobra.Command, cfg *ConfigFile, modelname string) (RunCon
 		}
 	}
 
+	// CLI flag overrides config
+	if cmd.Flags().Changed("timeout") {
+		finalTimeout = timeoutSec
+	}
+
 	return RunConfig{
 		ModelName:          modelname,
 		ApiKey:             apiKey,
 		ApiBase:            apiBase,
 		Temperature:        temperature,
+		Timeout:            time.Duration(finalTimeout) * time.Second,
 		Seed:               seed,
 		MaxTokens:          maxTokens,
 		ReasoningEffort:    reasoningEffort,
 		ReasoningMaxTokens: reasoningMax,
 		ReasoningExclude:   reasoningExclude,
+		Verbosity:          verbosity,
 		ContextOrder:       contextOrder,
 		ExtraBody:          extraBody,
 	}, nil
 }
 
 func putTextIntoClipboard(text string) error {
-	var cmd *exec.Cmd
-	switch runtime.GOOS {
-	case "darwin": // macOS
-		cmd := exec.Command("pbcopy")
-		stdin, err := cmd.StdinPipe()
-		if err != nil {
-			return err
-		}
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		err = cmd.Start()
-		if err != nil {
-			return err
-		}
-		_, err = stdin.Write([]byte(text))
-		if err != nil {
-			return err
-		}
-		err = stdin.Close()
-		if err != nil {
-			return err
-		}
-		err = cmd.Wait()
-		if err != nil {
-			return err
-		}
-		return nil
-	case "linux":
-		cmd = exec.Command("xclip", "-selection", "clipboard", text)
-		return cmd.Run()
-	case "windows":
-		cmd = exec.Command("clip", text)
-		return cmd.Run()
-	default:
-		return errors.New("unsupported OS")
-	}
+	return clipboard.WriteAll(text)
 }
 
 type Session struct {
@@ -781,31 +804,9 @@ func generateUUID() string {
 	return base64.URLEncoding.EncodeToString(u)
 }
 
+// Legacy dumpToHistory replaced by global historyMgr
 func dumpToHistory(session *Session, data interface{}) error {
-	configDir, err := os.UserHomeDir()
-	if err != nil {
-		return err
-	}
-	historyDir := filepath.Join(configDir, ".config/llmcli")
-
-	if _, err := os.Stat(historyDir); os.IsNotExist(err) {
-		if err := os.MkdirAll(historyDir, 0o755); err != nil {
-			return err
-		}
-	}
-	historyFile := filepath.Join(historyDir, "history.jsonl")
-	f, err := os.OpenFile(historyFile, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	jsonData, err := json.Marshal(data)
-	if err != nil {
-		return err
-	}
-	jsonString := string(jsonData) + "\n"
-	_, err = f.WriteString(jsonString)
-	return err
+	return nil
 }
 
 func main() {
@@ -826,21 +827,28 @@ func main() {
 	rootCmd.Flags().StringP("model", "m", "", "LLM model: OPENAI_API_MODEL,GROQ_API_MODEL,LLM_MODEL from env or gpt-3.5-turbo")
 	rootCmd.Flags().StringP("prompt", "p", "", "System prompt")
 	rootCmd.Flags().Float64P("temperature", "t", 0.0, "Temperature")
+	rootCmd.Flags().Int("timeout", 4200, "API timeout in seconds (default 70 mins)")
 	rootCmd.Flags().IntP("seed", "r", 1337, "Random seed")
 	rootCmd.Flags().IntP("max_tokens", "N", 4096, "Max amount of tokens in response")
 	rootCmd.Flags().BoolP("stream", "S", is_terminal, "Stream output")
 
-	// Reasoning controls (OpenRouter-style)
+	// Reasoning controls
+	rootCmd.Flags().String("reasoning", "", "Reasoning effort (low, medium, high, etc.)")
 	rootCmd.Flags().BoolP("no-reasoning", "n", false, "Disable reasoning entirely")
 	rootCmd.Flags().Bool("reasoning-low", false, "Reasoning effort: low/minimal (~10-20% tokens)")
 	rootCmd.Flags().Bool("reasoning-medium", false, "Reasoning effort: medium (~50%)")
 	rootCmd.Flags().Bool("reasoning-high", false, "Reasoning effort: high (~80%)")
+	rootCmd.Flags().Bool("reasoning-xhigh", false, "Reasoning effort: xhigh (max reasoning)")
 	rootCmd.Flags().IntP("reasoning-max", "R", 0, "Reasoning max_tokens (e.g., -R2048)")
 	rootCmd.Flags().Bool("reasoning-exclude", false, "Use reasoning but exclude from response")
 	// Aliases
 	rootCmd.Flags().SetAnnotation("reasoning-low", cobra.BashCompOneRequiredFlag, []string{"false"})
 	rootCmd.Flags().SetAnnotation("reasoning-medium", cobra.BashCompOneRequiredFlag, []string{"false"})
 	rootCmd.Flags().SetAnnotation("reasoning-high", cobra.BashCompOneRequiredFlag, []string{"false"})
+	rootCmd.Flags().SetAnnotation("reasoning-xhigh", cobra.BashCompOneRequiredFlag, []string{"false"})
+
+	// Verbosity
+	rootCmd.Flags().String("verbosity", "", "Response verbosity: low|medium|high")
 
 	// Chat/IO
 	rootCmd.Flags().BoolP("chat", "c", false, "Launch chat mode")
@@ -902,33 +910,150 @@ func main() {
 	}
 	rootCmd.AddCommand(integrationCmd)
 
+	// NEW: Search Subcommand
+	searchCmd := &cobra.Command{
+		Use:   "search [query]",
+		Short: "Search conversation history",
+		Long:  "Search for messages in history. Use 'user:term' or 'ai:term' to filter by role.",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if historyMgr == nil {
+				return fmt.Errorf("history manager not initialized")
+			}
+			results, err := historyMgr.Search(args[0])
+			if err != nil {
+				return err
+			}
+			if len(results) == 0 {
+				fmt.Println("No matches found.")
+				return nil
+			}
+			for _, r := range results {
+				fmt.Printf("\033[1;34m%s\033[0m [%s] (%s): %s\n", r.Timestamp.Format("2006-01-02 15:04"), r.SessionUUID[:8], r.Role, r.Preview)
+			}
+			return nil
+		},
+	}
+	rootCmd.AddCommand(searchCmd)
+
+	// NEW: Doctor Subcommand (System Check)
+	doctorCmd := &cobra.Command{
+		Use:   "doctor",
+		Short: "Check system capabilities and dependencies",
+		Run: func(cmd *cobra.Command, args []string) {
+			fmt.Println("LLM CLI Doctor")
+			fmt.Println("==============")
+
+			// 1. Check FTS5 Support
+			if history.CheckFTS() {
+				fmt.Println("✅ SQLite FTS5   : Enabled (Search Available)")
+			} else {
+				fmt.Println("❌ SQLite FTS5   : Disabled")
+				fmt.Println("   -> FIX: Build with '-tags sqlite_fts5'")
+			}
+
+			// 2. Check Config
+			home, _ := os.UserHomeDir()
+			configPath := filepath.Join(home, ".llmterm", "config.yaml")
+			if _, err := os.Stat(configPath); err == nil {
+				fmt.Printf("✅ Configuration : Found (%s)\n", configPath)
+			} else {
+				fmt.Printf("⚠️  Configuration : Missing (%s)\n", configPath)
+			}
+
+			// 3. Check API Key
+			if os.Getenv("OPENAI_API_KEY") != "" {
+				fmt.Println("✅ OPENAI_API_KEY: Set")
+			} else {
+				fmt.Println("⚠️  OPENAI_API_KEY: Not set (Check env or config)")
+			}
+		},
+	}
+	rootCmd.AddCommand(doctorCmd)
+
+	// NEW: Resume Subcommand
+	resumeCmd := &cobra.Command{
+		Use:   "resume [uuid] [message]",
+		Short: "Resume a previous session",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if historyMgr == nil {
+				return fmt.Errorf("history manager not initialized")
+			}
+			
+			// Resolve UUID
+			partial := args[0]
+			uuid, err := historyMgr.ResolveSessionUUID(partial)
+			if err != nil {
+				return err
+			}
+
+			msgs, err := historyMgr.GetSessionMessages(uuid)
+			if err != nil {
+				return fmt.Errorf("failed to load session: %w", err)
+			}
+			if len(msgs) == 0 {
+				return fmt.Errorf("session not found or empty")
+			}
+
+			// Reconstruct messages
+			var llmMsgs []Message
+			for _, m := range msgs {
+				llmMsgs = append(llmMsgs, Message{
+					Role:    m.Role,
+					Content: m.Content,
+					UUID:    m.UUID,
+				})
+			}
+
+			// Handle input arguments
+			var nextPrompt []string
+			if len(args) > 1 {
+				// Non-interactive follow up
+				cmd.Flags().Set("chat", "false")
+				nextPrompt = args[1:]
+			} else {
+				// Interactive mode
+				cmd.Flags().Set("chat", "true")
+			}
+
+			resumedMessages = llmMsgs
+			resumedSessionUUID = uuid
+			
+			return runLLMChat(cmd, nextPrompt)
+		},
+	}
+	rootCmd.AddCommand(resumeCmd)
+
+	// Initialize History Manager
+	home, _ := os.UserHomeDir()
+	histDir := filepath.Join(home, ".config/llmcli")
+	os.MkdirAll(histDir, 0755)
+
+	hm, err := history.New(filepath.Join(histDir, "history.db"), filepath.Join(histDir, "history.jsonl"))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to init history: %v\n", err)
+	} else {
+		historyMgr = hm
+		defer hm.Close()
+	}
+
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Println(err)
 		os.Exit(1)
 	}
 }
 
+var resumedMessages []Message
+var resumedSessionUUID string
+
 func markChatStart(session *Session, userMsg, systemPrompt, model string, seed int, temperature float64, apiBase string, maxTokens int, jsonMode bool, stopSequences interface{}, extraParams string, jsonSchema string, reasoningEffort string, reasoningMaxTokens int, reasoningExclude bool) error {
-	data := struct {
-		SID                string      `json:"sid"`
-		TS                 int         `json:"ts"`
-		UserMsg            string      `json:"user_msg"`
-		SystemPrompt       string      `json:"system_prompt"`
-		Model              string      `json:"model"`
-		Seed               int         `json:"seed"`
-		Temperature        float64     `json:"temperature"`
-		APIBase            string      `json:"api_base"`
-		MaxTokens          int         `json:"max_tokens"`
-		JSONMode           bool        `json:"json_mode"`
-		StopSequences      interface{} `json:"stop_sequences"`
-		ExtraParams        string      `json:"extra_params"`
-		JsonSchema         string      `json:"json_schema"`
-		ReasoningEffort    string      `json:"reasoning_effort,omitempty"`
-		ReasoningMaxTokens int         `json:"reasoning_max_tokens,omitempty"`
-		ReasoningExclude   bool        `json:"reasoning_exclude,omitempty"`
-	}{
+	if historyMgr == nil {
+		return nil
+	}
+	event := history.SessionStartEvent{
 		SID:                session.UUID,
-		TS:                 int(time.Now().Unix()),
+		TS:                 time.Now().Unix(),
 		UserMsg:            userMsg,
 		SystemPrompt:       systemPrompt,
 		Model:              model,
@@ -944,11 +1069,21 @@ func markChatStart(session *Session, userMsg, systemPrompt, model string, seed i
 		ReasoningMaxTokens: reasoningMaxTokens,
 		ReasoningExclude:   reasoningExclude,
 	}
-	return dumpToHistory(session, data)
+	return historyMgr.SaveSessionStart(event)
 }
 
 func getFirstEnv(fallback string, envVars ...string) string {
-	for _, env := range envVars {
+	// Also check for common API key environment variables that might contain model info
+	additionalVars := []string{
+		"OPENAI_API_MODEL",
+		"GROQ_API_MODEL",
+		"LLM_MODEL",
+		"ANTHROPIC_API_MODEL", // Add Anthropic for completeness
+	}
+
+	allVars := append(envVars, additionalVars...)
+
+	for _, env := range allVars {
 		v := os.Getenv(env)
 		if v != "" {
 			return v
@@ -963,23 +1098,32 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	if isSession {
 		cfg, err := loadConfig()
 		if err != nil {
-			cfg = &ConfigFile{}
+			return err
 		}
 		return runSession(cmd, args, cfg)
 	}
 
 	preRunTime := time.Now()
-	session := newSession()
+
+	// Handle Resume
+	var session *Session
+	if resumedSessionUUID != "" {
+		session = &Session{UUID: resumedSessionUUID, Timestamp: time.Now()}
+	} else {
+		session = newSession()
+	}
 
 	modelname, _ := cmd.Flags().GetString("model")
 
 	cfg, err := loadConfig()
 	if err != nil {
-		log.Printf("Warning: failed to load config: %v", err)
-		cfg = &ConfigFile{}
+		return err
 	}
 
-	if len(modelname) == 0 {
+	// FIX: Check if model was explicitly provided via flag
+	modelFlagProvided := cmd.Flags().Changed("model")
+
+	if !modelFlagProvided && len(modelname) == 0 {
 		if cfg.Default != "" {
 			modelname = cfg.Default
 		} else {
@@ -1007,6 +1151,7 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	reasoningLow, _ := cmd.Flags().GetBool("reasoning-low")
 	reasoningMedium, _ := cmd.Flags().GetBool("reasoning-medium")
 	reasoningHigh, _ := cmd.Flags().GetBool("reasoning-high")
+	reasoningXHigh, _ := cmd.Flags().GetBool("reasoning-xhigh")
 	reasoningMax, _ := cmd.Flags().GetInt("reasoning-max")
 	reasoningExclude, _ := cmd.Flags().GetBool("reasoning-exclude")
 
@@ -1084,6 +1229,7 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	reasoningLow = false
 	reasoningMedium = false
 	reasoningHigh = false
+	reasoningXHigh = false
 
 	switch runCfg.ReasoningEffort {
 	case "none":
@@ -1094,6 +1240,8 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 		reasoningMedium = true
 	case "high":
 		reasoningHigh = true
+	case "xhigh":
+		reasoningXHigh = true
 	}
 
 	// Apply top-level piped_input_wrapper from config if flag not explicitly set
@@ -1116,8 +1264,13 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 
 	messages := make([]Message, 0)
 
-	if len(strings.TrimSpace(systemPrompt)) > 0 {
-		messages = append(messages, *NewMessage("system", systemPrompt))
+	// If resuming, use loaded messages
+	if len(resumedMessages) > 0 {
+		messages = resumedMessages
+	} else {
+		if len(strings.TrimSpace(systemPrompt)) > 0 {
+			messages = append(messages, *NewMessage("system", systemPrompt))
+		}
 	}
 
 	// === File Context Resolution ===
@@ -1387,6 +1540,10 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 		reasoningEffort = "high"
 		reasoningFlagCount++
 	}
+	if reasoningXHigh {
+		reasoningEffort = "xhigh"
+		reasoningFlagCount++
+	}
 	if reasoningMax > 0 {
 		reasoningConfiguredMax = reasoningMax
 		reasoningFlagCount++
@@ -1403,7 +1560,10 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 		fmt.Printf("PROMPT: \"%s\"\nSYSTEM MESSAGE: \"%s\"\n", debugUsermsg, systemPrompt)
 	}
 
-	markChatStart(session, usermsg, systemPrompt, modelname, seed, temperature, apiBase, maxTokens, jsonMode, stopSeqInterface, extraParams, jsonSchema, reasoningEffort, reasoningConfiguredMax, reasoningConfiguredExclude)
+	// Only mark start if new session
+	if resumedSessionUUID == "" {
+		markChatStart(session, usermsg, systemPrompt, modelname, seed, temperature, apiBase, maxTokens, jsonMode, stopSeqInterface, extraParams, jsonSchema, reasoningEffort, reasoningConfiguredMax, reasoningConfiguredExclude)
+	}
 
 	var extra map[string]interface{}
 
@@ -1416,26 +1576,32 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 		"max_tokens": maxTokens,
 	}
 
-	// Build reasoning object if any reasoning flags are set
-	var reasoningObj map[string]interface{}
-	if reasoningEffort != "" {
-		reasoningObj = map[string]interface{}{
-			"effort": reasoningEffort,
-		}
-	} else if reasoningConfiguredMax > 0 {
-		reasoningObj = map[string]interface{}{
-			"max_tokens": reasoningConfiguredMax,
-		}
+	// Use flat reasoning_effort for Chat Completions (OpenAI/New Standard)
+	// We use the runCfg value which is the source of truth after flag/config resolution
+	if runCfg.ReasoningEffort != "" && runCfg.ReasoningEffort != "none" {
+		extra["reasoning_effort"] = runCfg.ReasoningEffort
 	}
 
-	// Add exclude flag if set and we have a reasoning object
-	if reasoningConfiguredExclude && reasoningObj != nil {
+	// Handle legacy/OpenRouter specific fields via reasoning object
+	// We construct this separately because some providers (OpenRouter) might want
+	// both reasoning_effort (flat) AND extra parameters in a reasoning object,
+	// or reasoning_effort might be ignored if reasoning object is present depending on the provider.
+	// But based on user requirements to support exclude, we must send it.
+	reasoningObj := make(map[string]interface{})
+	if reasoningConfiguredMax > 0 {
+		reasoningObj["max_tokens"] = reasoningConfiguredMax
+	}
+	if reasoningConfiguredExclude {
 		reasoningObj["exclude"] = true
 	}
 
-	// Add reasoning to extra if configured
-	if reasoningObj != nil {
+	if len(reasoningObj) > 0 {
 		extra["reasoning"] = reasoningObj
+	}
+
+	// Add verbosity if set
+	if runCfg.Verbosity != "" {
+		extra["verbosity"] = runCfg.Verbosity
 	}
 
 	switch v := stopSeqInterface.(type) {
@@ -1469,6 +1635,10 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 		extra[k] = v
 	}
 
+	// Create context for LLM cancellation with configured timeout
+	ctx, cancel := context.WithTimeout(context.Background(), runCfg.Timeout)
+	defer cancel()
+
 	llmApiFunc := func(messages []Message) (<-chan string, error) {
 		filteredMessages := make([]LLMMessage, len(messages))
 		for i, msg := range messages {
@@ -1477,23 +1647,24 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 				Content: msg.Content,
 			}
 		}
-		return llmChat(filteredMessages, modelname, seed, temperature, nil, apiKey, apiBase, stream, extra, verbose)
+		return llmChat(ctx, filteredMessages, modelname, seed, temperature, nil, apiKey, apiBase, stream, extra, verbose)
 	}
 
 	llmHistoryFunc := func(msg Message) error {
-		data := struct {
-			ID      string  `json:"uuid"`
-			SID     string  `json:"sid"`
-			TS      int     `json:"ts"`
-			Message Message `json:"msg"`
-		}{
-			ID:      msg.UUID,
-			SID:     session.UUID,
-			TS:      int(time.Now().Unix()),
-			Message: msg,
+		if historyMgr == nil {
+			return nil
 		}
-
-		return dumpToHistory(session, data)
+		data := history.MessageEvent{
+			ID:  msg.UUID,
+			SID: session.UUID,
+			TS:  time.Now().Unix(),
+			Message: history.ChatMessage{
+				UUID:    msg.UUID,
+				Role:    msg.Role,
+				Content: msg.Content,
+			},
+		}
+		return historyMgr.SaveMessage(data)
 	}
 
 	if len(usermsg) == 0 || chat || chat_send {
@@ -1622,7 +1793,19 @@ type chatTuiState struct {
 	mdPaddingWidth int
 	shift          bool
 	sendRightAway  bool
+
+	// Search Mode
+	inSearch   bool
+	searchList list.Model
 }
+
+type item struct {
+	title, desc, uuid string
+}
+
+func (i item) Title() string       { return i.title }
+func (i item) Description() string { return i.desc }
+func (i item) FilterValue() string { return i.title + " " + i.desc }
 
 func getLastMsg(m chatTuiState) (Message, error) {
 	if len(m.llmMessages) == 0 {
@@ -1657,9 +1840,10 @@ func initialModel(session Session, messages []Message, llmHistoryApi func(Messag
 
 	sp := spinner.New()
 
-	if sendRightAway {
-
-	}
+	// Initialize Search List
+	searchList := list.New([]list.Item{}, list.NewDefaultDelegate(), 0, 0)
+	searchList.Title = "History Search"
+	searchList.SetShowHelp(false)
 
 	return chatTuiState{
 		spin:           false,
@@ -1677,6 +1861,7 @@ func initialModel(session Session, messages []Message, llmHistoryApi func(Messag
 		viewportWidth:  80,
 		mdPaddingWidth: 0,
 		sendRightAway:  sendRightAway,
+		searchList:     searchList,
 	}
 }
 
@@ -1828,6 +2013,45 @@ func (m chatTuiState) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return _m, tea.Batch(tiCmd, vpCmd, cmds)
 	}
 
+	if m.inSearch {
+		switch msg := msg.(type) {
+		case tea.KeyMsg:
+			if msg.Type == tea.KeyEsc || msg.Type == tea.KeyCtrlC {
+				m.inSearch = false
+				return m, nil
+			}
+			if msg.Type == tea.KeyEnter {
+				selectedItem := m.searchList.SelectedItem()
+				if selectedItem != nil {
+					i := selectedItem.(item)
+					// Resume Logic in TUI:
+					// Load messages for uuid
+					if historyMgr != nil {
+						msgs, err := historyMgr.GetSessionMessages(i.uuid)
+						if err == nil {
+							// Clear current
+							m.llmMessages = []Message{}
+							for _, mg := range msgs {
+								m.llmMessages = append(m.llmMessages, Message{
+									Role: mg.Role, Content: mg.Content, UUID: mg.UUID,
+								})
+							}
+							m.viewport.SetContent(formatMessageLog(m.llmMessages, m.renderMarkdown, m.viewportWidth, m.mdPaddingWidth, "", "", true))
+							m.viewport.GotoBottom()
+						}
+					}
+				}
+				m.inSearch = false
+				return m, nil
+			}
+		case tea.WindowSizeMsg:
+			m.searchList.SetSize(msg.Width, msg.Height)
+		}
+		var cmd tea.Cmd
+		m.searchList, cmd = m.searchList.Update(msg)
+		return m, cmd
+	}
+
 	switch msg := msg.(type) {
 
 	case tea.KeyMsg:
@@ -1835,6 +2059,27 @@ func (m chatTuiState) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case tea.KeyCtrlC, tea.KeyEsc:
 			return m, tea.Quit
+
+		case tea.KeyCtrlH: // Search
+			if historyMgr != nil {
+				m.inSearch = true
+				// Pre-populate with recent sessions
+				sessions, err := historyMgr.ListRecentSessions(20)
+				if err == nil {
+					items := []list.Item{}
+					for _, s := range sessions {
+						items = append(items, item{
+							title: fmt.Sprintf("%s (%s)", s.Timestamp.Format("01/02 15:04"), s.Model),
+							desc:  s.Summary,
+							uuid:  s.UUID,
+						})
+					}
+					m.searchList.SetItems(items)
+				}
+				// Size list
+				m.searchList.SetSize(m.viewportWidth+2, m.viewport.Height+m.textarea.Height())
+			}
+			return m, nil
 
 		case tea.KeyCtrlN: // ctrl+N
 			m.llmMessages = []Message{}
@@ -1939,6 +2184,9 @@ func (m chatTuiState) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m chatTuiState) View() string {
+	if m.inSearch {
+		return m.searchList.View()
+	}
 
 	if m.spin || m.streaming {
 		m.viewport.SetContent(formatMessageLog(m.llmMessages, m.renderMarkdown, m.viewportWidth, m.mdPaddingWidth, m.spinner.View(), "", true))

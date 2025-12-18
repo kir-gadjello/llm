@@ -13,8 +13,10 @@ require github.com/charmbracelet/bubbletea v0.26.2
 require github.com/charmbracelet/bubbles v0.18.0
 
 require (
+	github.com/atotto/clipboard v0.1.4
 	github.com/charmbracelet/lipgloss v0.9.1
 	github.com/creack/pty v1.1.24
+	github.com/mattn/go-sqlite3 v1.14.22
 	github.com/smacker/go-tree-sitter v0.0.0-20240827094217-dd81d9e9be82
 	github.com/vlanse/go-term-markdown v0.0.1-dev2
 	golang.org/x/term v0.37.0
@@ -24,7 +26,6 @@ require (
 require (
 	github.com/MichaelMure/go-term-text v0.3.1 // indirect
 	github.com/alecthomas/chroma v0.10.0 // indirect
-	github.com/atotto/clipboard v0.1.4 // indirect
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
 	github.com/disintegration/imaging v1.6.2 // indirect
 	github.com/dlclark/regexp2 v1.10.0 // indirect
@@ -43,6 +44,7 @@ require (
 	github.com/muesli/reflow v0.3.0 // indirect
 	github.com/muesli/termenv v0.15.2 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
+	github.com/sahilm/fuzzy v0.1.1-0.20230530133925-c48e322e2a8f // indirect
 	github.com/spf13/pflag v1.0.5 // indirect
 	golang.org/x/image v0.15.0 // indirect
 	golang.org/x/net v0.21.0 // indirect

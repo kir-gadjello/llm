@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -60,6 +61,7 @@ Return the list of relevant file paths:`, repoMap, query)
 
 	// Call LLM (non-streaming)
 	ch, err := llmChat(
+		context.Background(),
 		messages,
 		selectorModel,
 		42,  // seed

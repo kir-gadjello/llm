@@ -462,9 +462,6 @@ func runInlineLLM(cmd *cobra.Command, cfg *ConfigFile, query string, historyStr 
 	seed := runCfg.Seed
 	maxTokens := runCfg.MaxTokens
 	timeout := runCfg.Timeout
-	if maxTokens == 0 {
-		maxTokens = 1024
-	}
 
 	// 1. Visual separator
 	fmt.Printf("\r\033[1;34m🤖 %s:\033[0m\r\n", modelname)
@@ -493,7 +490,10 @@ func runInlineLLM(cmd *cobra.Command, cfg *ConfigFile, query string, historyStr 
 		fmt.Print("\r\n")
 	}
 
-	extra := map[string]interface{}{"max_tokens": maxTokens}
+	extra := map[string]interface{}{}
+	if maxTokens > 0 {
+		extra["max_tokens"] = maxTokens
+	}
 
 	// Merge ExtraBody
 	for k, v := range runCfg.ExtraBody {

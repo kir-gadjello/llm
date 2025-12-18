@@ -869,7 +869,7 @@ func main() {
 	rootCmd.Flags().Float64P("temperature", "t", 0.0, "Temperature")
 	rootCmd.Flags().Int("timeout", 4200, "API timeout in seconds (default 70 mins)")
 	rootCmd.Flags().IntP("seed", "r", 1337, "Random seed")
-	rootCmd.Flags().IntP("max_tokens", "N", 4096, "Max amount of tokens in response")
+	rootCmd.Flags().IntP("max_tokens", "N", 0, "Max amount of tokens in response (0 = model default)")
 	rootCmd.Flags().BoolP("stream", "S", is_terminal, "Stream output")
 
 	// Reasoning controls
@@ -1653,14 +1653,10 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 			fmt.Printf("\nPROMPT:\n%s\n\nSYSTEM MESSAGE:\n%s\n", debugUsermsg, systemPrompt)
 		}
 
-		if dryRun {
-			fmt.Println("\n[Dry Run] No request made.")
-			return nil
-		}
 	}
 
 	// Only mark start if new session
-	if resumedSessionUUID == "" {
+	if resumedSessionUUID == "" && !dryRun {
 		markChatStart(session, usermsg, systemPrompt, modelname, seed, temperature, apiBase, maxTokens, jsonMode, stopSeqInterface, extraParams, jsonSchema, reasoningEffort, reasoningConfiguredMax, reasoningConfiguredExclude)
 	}
 
@@ -1671,8 +1667,9 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 		log.Fatal(err)
 	}
 
-	extra = map[string]interface{}{
-		"max_tokens": maxTokens,
+	extra = map[string]interface{}{}
+	if maxTokens > 0 {
+		extra["max_tokens"] = maxTokens
 	}
 
 	// Use flat reasoning_effort for Chat Completions (OpenAI/New Standard)
@@ -1732,6 +1729,34 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	// CLI params override config
 	for k, v := range extraParamsMap {
 		extra[k] = v
+	}
+
+	if dryRun {
+		// Construct full payload for display
+		req := LLMChatRequestBasic{
+			Model:       modelname,
+			Seed:        seed,
+			Temperature: temperature,
+			Stream:      stream,
+			Messages:    make([]LLMMessage, len(messages)),
+		}
+		// convert messages
+		for i, m := range messages {
+			req.Messages[i] = LLMMessage{Role: m.Role, Content: m.Content}
+		}
+
+		mergedData := map[string]interface{}{}
+		reqJson, _ := json.Marshal(req)
+		json.Unmarshal(reqJson, &mergedData)
+		for k, v := range extra {
+			mergedData[k] = v
+		}
+
+		fmt.Printf("\nAPI Base: %s\n", apiBase)
+		jsonBytes, _ := json.MarshalIndent(mergedData, "", "  ")
+		fmt.Printf("Request Body:\n%s\n", string(jsonBytes))
+
+		return nil
 	}
 
 	// Create context for LLM cancellation with configured timeout

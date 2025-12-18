@@ -101,6 +101,7 @@ type Case struct {
 	In        string   // Stdin
 	Conf      string   // Optional .llmterm.yaml content
 	Want      string   // Substring expected in output (which is the echoed request)
+	WantMiss  string   // Substring expected to be MISSING from output
 	ExpectErr bool     // Expect command to fail
 }
 
@@ -132,6 +133,12 @@ func TestCLI(t *testing.T) {
 			Name: "Max Tokens",
 			Args: []string{"-N", "123", "hi"},
 			Want: `"max_tokens":123`,
+		},
+		{
+			Name: "Max Tokens Omitted",
+			Args: []string{"hi"},
+			Want: `"model"`, // Ensure request was made
+			WantMiss: `"max_tokens"`,
 		},
 		{
 			Name: "JSON Mode",
@@ -334,6 +341,9 @@ models:
 
 			if !strings.Contains(output, tc.Want) {
 				t.Errorf("Want substring %q not found in output.\n--- CLI Output (Echoed Request) ---\n%s\n-----------------------------------", tc.Want, output)
+			}
+			if tc.WantMiss != "" && strings.Contains(output, tc.WantMiss) {
+				t.Errorf("WantMiss substring %q WAS found in output.\n--- CLI Output ---\n%s\n", tc.WantMiss, output)
 			}
 		})
 	}

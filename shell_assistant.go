@@ -93,8 +93,9 @@ Environment Context:
 
 	// Call LLM
 	llmCallStartTime := time.Now()
-	extra := map[string]interface{}{
-		"max_tokens": maxTokens,
+	extra := map[string]interface{}{}
+	if maxTokens > 0 {
+		extra["max_tokens"] = maxTokens
 	}
 	// Merge ExtraBody from config
 	for k, v := range runCfg.ExtraBody {

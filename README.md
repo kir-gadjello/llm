@@ -13,6 +13,7 @@ llm "your message"
 llm -p "system prompt" "user message"
 echo "data" | llm "analyze this"
 llm -c  # interactive chat
+llm search "query"  # search history
 ```
 
 ### Session Mode
@@ -35,6 +36,23 @@ source <(llm integration zsh)   # or bash, fish
 ```
 
 Shell integration uses OSC 133 sequences to parse command boundaries, providing clean structured history instead of raw terminal output.
+
+### History & Session Management
+
+**Search History**
+Query your local conversation database using full-text search (requires FTS5 support):
+
+```bash
+llm search "database migration"
+llm search "user:optimization"  # Filter by role
+```
+
+**Resume Session**
+Continue a conversation from a specific session UUID (found via search):
+
+```bash
+llm resume <uuid> "continue explaining the previous point"
+```
 
 ### Shell Assistant
 
@@ -72,6 +90,7 @@ Control reasoning token generation for models that support it (OpenAI o-series, 
 llm -m o1 --reasoning-high "explain quantum entanglement"
 llm -m grok-2 -n "simple task"  # disable reasoning
 llm -R2048 "complex analysis"   # specific token budget
+llm --reasoning-exclude         # use reasoning but exclude it from output
 ```
 
 ### Clipboard Integration
@@ -173,6 +192,29 @@ llm -A "@staged ensure these changes don't break auth"
 
 Binary files are automatically detected and replaced with `[Binary File]` placeholders to avoid sending garbage to the LLM.
 
+## Debugging & Diagnostics
+
+**System Check**
+Verify installation health, config paths, and FTS5 support:
+
+```bash
+llm doctor
+```
+
+**Performance Metrics**
+Show Time-To-First-Token (TTFT) and generation speed (TPS):
+
+```bash
+llm --vt "count to 100"
+```
+
+**Dry Run**
+Preview prompt assembly, token estimation, and API parameters without making a network request:
+
+```bash
+llm --dry -f src/main.go "explain this"
+```
+
 ## Configuration
 
 Create `~/.llmterm.yaml` for model profiles with inheritance:
@@ -231,9 +273,10 @@ Use with `-m <profile>`. CLI flags override config values.
 **Profile parameters:**
 - `model`: actual model name sent to API
 - `api_base`, `api_key`: endpoint configuration
-- `reasoning_effort`: none, low, medium, high
+- `reasoning_effort`: none, low, medium, high, xhigh
 - `reasoning_max_tokens`: integer token budget
 - `reasoning_exclude`: exclude reasoning from response
+- `verbosity`: low, medium, high
 - `context_order`: prepend, append (for clipboard)
 - `extra_body`: arbitrary JSON fields for the API request
 

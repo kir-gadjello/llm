@@ -97,6 +97,24 @@ Environment Context:
 	if maxTokens > 0 {
 		extra["max_tokens"] = maxTokens
 	}
+
+	// Reasoning Logic
+	if runCfg.ReasoningEffort != "" && runCfg.ReasoningEffort != "none" {
+		extra["reasoning_effort"] = runCfg.ReasoningEffort
+	}
+
+	reasoningObj := make(map[string]interface{})
+	if runCfg.ReasoningMaxTokens > 0 {
+		reasoningObj["max_tokens"] = runCfg.ReasoningMaxTokens
+	}
+	if runCfg.ReasoningExclude {
+		reasoningObj["exclude"] = true
+	}
+
+	if len(reasoningObj) > 0 {
+		extra["reasoning"] = reasoningObj
+	}
+
 	// Merge ExtraBody from config
 	for k, v := range runCfg.ExtraBody {
 		extra[k] = v

@@ -72,6 +72,21 @@ func MockEchoHandler() http.HandlerFunc {
 						json.NewEncoder(w).Encode(response)
 						return
 					}
+					// Special Logic: Auto Selector
+					if strings.Contains(content, "smart file selector") {
+						response := map[string]interface{}{
+							"choices": []interface{}{
+								map[string]interface{}{
+									"message": map[string]interface{}{
+										"role":    "assistant",
+										"content": "subdir/test.txt",
+									},
+								},
+							},
+						}
+						json.NewEncoder(w).Encode(response)
+						return
+					}
 				}
 			}
 		}
@@ -113,6 +128,25 @@ func TestCLI(t *testing.T) {
 	// 2. Setup Environment
 	tempHome, _ := os.MkdirTemp("", "llm-home")
 	defer os.RemoveAll(tempHome)
+	tempCwd, _ := os.MkdirTemp("", "llm-cwd")
+	if resolved, err := filepath.EvalSymlinks(tempCwd); err == nil {
+		tempCwd = resolved
+	}
+	defer os.RemoveAll(tempCwd)
+
+	// Create dummy file for file tests
+	os.MkdirAll(filepath.Join(tempCwd, "subdir"), 0755)
+	os.WriteFile(filepath.Join(tempCwd, "subdir", "test.txt"), []byte("file_content"), 0644)
+	absPath := filepath.Join(tempCwd, "subdir", "test.txt")
+	if runtime.GOOS == "windows" {
+		absPath = strings.ReplaceAll(absPath, "\\", "\\\\")
+	}
+
+	// Initialize Git for @staged tests
+	exec.Command("git", "-C", tempCwd, "init").Run()
+	exec.Command("git", "-C", tempCwd, "config", "user.email", "test@example.com").Run()
+	exec.Command("git", "-C", tempCwd, "config", "user.name", "Test").Run()
+	exec.Command("git", "-C", tempCwd, "add", ".").Run()
 
 	baseConfig := fmt.Sprintf("models:\n  default:\n    api_base: %s\n", server.URL)
 
@@ -217,25 +251,92 @@ func TestCLI(t *testing.T) {
 			Name: "Piped Input (Default)",
 			In:   "some_data",
 			Args: []string{"analyze"},
+			// Armor is on by default, piped wrapper "context" is merged into armor
 			Want: "\\u003ccontext\\u003e\\nsome_data\\n\\u003c/context\\u003e",
 		},
 		{
 			Name: "Piped Input (Custom Wrapper)",
 			In:   "some_data",
 			Args: []string{"-w", "code", "analyze"},
-			Want: "\\u003ccode\\u003e\\nsome_data\\n\\u003c/code\\u003e",
+			// Armor wraps custom wrapper
+			Want: "\\u003ccontext\\u003e\\n\\u003ccode\\u003e\\nsome_data\\n\\u003c/code\\u003e\\n\\u003c/context\\u003e",
 		},
 		{
 			Name: "Piped Input (No Wrapper)",
 			In:   "raw_data",
 			Args: []string{"-w", "", "analyze"},
-			Want: "analyze\\n\\nraw_data", // Appended raw (default append)
+			// Armor wraps raw data
+			Want: "\\u003ccontext\\u003e\\nraw_data\\n\\u003c/context\\u003e",
 		},
 		{
 			Name: "Context Order Append",
 			In:   "data",
 			Args: []string{"-w", "ctx", "--context-order", "append", "prompt"},
-			Want: "prompt\\n\\n\\u003cctx\\u003e\\ndata\\n\\u003c/ctx\\u003e",
+			// Armor wraps custom ctx
+			Want: "prompt\\n\\n\\u003ccontext\\u003e\\n\\u003cctx\\u003e\\ndata\\n\\u003c/ctx\\u003e\\n\\u003c/context\\u003e",
+		},
+		{
+			Name: "Context Armor Disabled",
+			In:   "data",
+			Args: []string{"-w", "ctx", "--context-armor=false", "prompt"},
+			// No outer context tag
+			Want: "\\u003cctx\\u003e\\ndata\\n\\u003c/ctx\\u003e",
+		},
+
+		// --- File Names ---
+		{
+			Name: "Show Filenames Relative",
+			Args: []string{"-f", "subdir/test.txt", "--show-filenames", "relative", "hi"},
+			Want: "File: subdir/test.txt",
+		},
+		{
+			Name: "Show Filenames Absolute",
+			Args: []string{"-f", "subdir/test.txt", "--show-filenames", "absolute", "hi"},
+			Want: "File: " + absPath,
+		},
+		{
+			Name: "Show Filenames NameOnly",
+			Args: []string{"-f", "subdir/test.txt", "--show-filenames", "name-only", "hi"},
+			Want: "File: test.txt",
+		},
+		{
+			Name:     "Show Filenames None",
+			Args:     []string{"-f", "subdir/test.txt", "--show-filenames", "none", "hi"},
+			Want:     "```text\\nfile_content\\n```",
+			WantMiss: "File: ",
+		},
+
+		// --- Context Format ---
+		{
+			Name: "Context XML (Armored)",
+			Args: []string{"-f", "subdir/test.txt", "-i", "xml", "hi"},
+			// formatContext should NOT output outer <context>, main should do it
+			Want: "\\u003ccontext\\u003e\\n\\u003cfiles\\u003e\\n\\u003cfile path=\\\"subdir/test.txt\\\"\\u003e",
+		},
+		{
+			Name: "Context XML (Unarmored)",
+			Args: []string{"-f", "subdir/test.txt", "-i", "xml", "--context-armor=false", "hi"},
+			// formatContext should output outer <context> for backwards compat
+			Want: "\\u003ccontext\\u003e\\n\\u003cfiles\\u003e\\n\\u003cfile path=\\\"subdir/test.txt\\\"\\u003e",
+		},
+
+		// --- Path Expansion & Git ---
+		{
+			Name: "Glob Expansion",
+			Args: []string{"-f", "subdir/*.txt", "hi"},
+			Want: "File: subdir/test.txt",
+		},
+		{
+			Name: "Git Staged",
+			Args: []string{"@staged", "hi"},
+			Want: "File: subdir/test.txt",
+		},
+
+		// --- Auto Selector ---
+		{
+			Name: "Auto Selector",
+			Args: []string{"-A", "hi"},
+			Want: "File: subdir/test.txt",
 		},
 
 		// --- Config Files ---
@@ -297,10 +398,30 @@ models:
 			ExpectErr: true,
 		},
 		{
-			Name:      "Resume Session",
-			Args:      []string{"resume", "bad-uuid"},
-			Want:      "session not found",
+			Name: "Resume Session",
+			Args: []string{"resume", "bad-uuid"},
+			Want: "session not found",
 			ExpectErr: true,
+		},
+		{
+			Name: "History List",
+			Args: []string{"history"},
+			Want: "remember_this_keyword", // Should list the session from previous test
+		},
+		{
+			Name: "Chat Send Short Flag",
+			Args: []string{"-C", "hello", "--dry"},
+			Want: `"content": "hello"`,
+		},
+		{
+			Name: "Save To File",
+			Args: []string{"save_test", "--save-to", "output.md"},
+			Want: "Saved output to",
+		},
+		{
+			Name: "Save To Dir",
+			Args: []string{"save_test_dir", "--save-to", "."},
+			Want: "Saved output to",
 		},
 	}
 
@@ -317,6 +438,7 @@ models:
 
 			// Prepare Command
 			cmd := exec.Command(llmBinaryPath, tc.Args...)
+			cmd.Dir = tempCwd
 
 			// Environment
 			cmd.Env = append(os.Environ(),

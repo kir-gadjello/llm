@@ -11,8 +11,10 @@ go install github.com/kir-gadjello/llm@latest
 ```bash
 llm "your message"
 llm -p "system prompt" "user message"
+llm -C "user message" # start chat and send immediately
 echo "data" | llm "analyze this"
 llm -c  # interactive chat
+llm history # browse recent chats
 llm search "query"  # search history
 ```
 
@@ -98,6 +100,21 @@ llm --reasoning-exclude         # use reasoning but exclude it from output
 ```bash
 pbcopy < file.txt && llm -x "review this"
 llm -x --context-order append "context after prompt"
+```
+
+### Context Formatting
+
+Control how files are presented to the model:
+
+```bash
+# Show relative paths (default)
+llm -f main.go
+
+# Hide filenames
+llm -f main.go --show-filenames none
+
+# Use XML format instead of Markdown
+llm -f main.go --context-format xml
 ```
 
 ### Constrained Generation

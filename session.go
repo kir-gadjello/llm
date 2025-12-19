@@ -501,22 +501,19 @@ func runInlineLLM(cmd *cobra.Command, cfg *ConfigFile, query string, historyStr 
 	}
 
 	// Reasoning Logic
-	var reasoningObj map[string]interface{}
 	if runCfg.ReasoningEffort != "" && runCfg.ReasoningEffort != "none" {
-		reasoningObj = map[string]interface{}{
-			"effort": runCfg.ReasoningEffort,
-		}
-	} else if runCfg.ReasoningMaxTokens > 0 {
-		reasoningObj = map[string]interface{}{
-			"max_tokens": runCfg.ReasoningMaxTokens,
-		}
+		extra["reasoning_effort"] = runCfg.ReasoningEffort
 	}
 
-	if runCfg.ReasoningExclude && reasoningObj != nil {
+	reasoningObj := make(map[string]interface{})
+	if runCfg.ReasoningMaxTokens > 0 {
+		reasoningObj["max_tokens"] = runCfg.ReasoningMaxTokens
+	}
+	if runCfg.ReasoningExclude {
 		reasoningObj["exclude"] = true
 	}
 
-	if reasoningObj != nil {
+	if len(reasoningObj) > 0 {
 		extra["reasoning"] = reasoningObj
 	}
 

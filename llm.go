@@ -73,12 +73,28 @@ func NewMessage(role, content string) *Message {
 	}
 }
 
-func formatContext(files []FileContext, format string, truncateLimit int) string {
+func formatContext(files []FileContext, format string, filenameMode string, cwd string, truncateLimit int, useOuterTags bool) string {
 	var buf strings.Builder
 
-	if format == "md" {
-		for _, f := range files {
-			buf.WriteString(fmt.Sprintf("File: %s\n", f.Path))
+	for _, f := range files {
+		displayPath := f.Path
+		switch filenameMode {
+		case "relative":
+			if rel, err := filepath.Rel(cwd, f.Path); err == nil {
+				displayPath = rel
+			}
+		case "name-only":
+			displayPath = filepath.Base(f.Path)
+		case "none":
+			displayPath = ""
+		case "absolute":
+			// keep absolute
+		}
+
+		if format == "md" {
+			if displayPath != "" {
+				buf.WriteString(fmt.Sprintf("File: %s\n", displayPath))
+			}
 			if f.IsBinary {
 				buf.WriteString("[Binary File]\n")
 			} else {
@@ -97,28 +113,39 @@ func formatContext(files []FileContext, format string, truncateLimit int) string
 				buf.WriteString("```\n")
 			}
 			buf.WriteString("\n")
+		} else {
+			// xml
+			if displayPath != "" {
+				buf.WriteString(fmt.Sprintf("<file path=\"%s\">\n", displayPath))
+			} else {
+				buf.WriteString("<file>\n")
+			}
+			if f.IsBinary {
+				buf.WriteString("[Binary File]\n")
+			} else {
+				content := f.Content
+				if truncateLimit > 0 {
+					lines := strings.Split(content, "\n")
+					if len(lines) > truncateLimit {
+						content = strings.Join(lines[:truncateLimit], "\n") + fmt.Sprintf("\n... [truncated %d lines] ...", len(lines)-truncateLimit)
+					}
+				}
+				buf.WriteString(content)
+			}
+			buf.WriteString("\n</file>\n")
 		}
-		return buf.String()
 	}
 
-	buf.WriteString("<context>\n<files>\n")
-	for _, f := range files {
-		buf.WriteString(fmt.Sprintf("<file path=\"%s\">\n", f.Path))
-		if f.IsBinary {
-			buf.WriteString("[Binary File]\n")
-		} else {
-			content := f.Content
-			if truncateLimit > 0 {
-				lines := strings.Split(content, "\n")
-				if len(lines) > truncateLimit {
-					content = strings.Join(lines[:truncateLimit], "\n") + fmt.Sprintf("\n... [truncated %d lines] ...", len(lines)-truncateLimit)
-				}
-			}
-			buf.WriteString(content)
+	if format != "md" {
+		inner := buf.String()
+		// If using outer tags (armor disabled or implicit), wrap in context
+		// Otherwise just return the files block to be wrapped by global armor
+		if useOuterTags {
+			return "<context>\n<files>\n" + inner + "</files>\n</context>"
 		}
-		buf.WriteString("\n</file>\n")
+		return "<files>\n" + inner + "</files>\n"
 	}
-	buf.WriteString("</files>\n</context>")
+
 	return buf.String()
 }
 
@@ -155,6 +182,7 @@ type ContextConfig struct {
 type ConfigFile struct {
 	Default             string                 `yaml:"default,omitempty"`
 	Timeout             *int                   `yaml:"timeout,omitempty"` // Global default in seconds
+	ContextArmor        *bool                  `yaml:"context_armor,omitempty"`
 	PipedInputWrapper   *string                `yaml:"piped_input_wrapper,omitempty"`
 	LogReasoning        *bool                  `yaml:"log_reasoning,omitempty"`
 	LogReasoningShorten *int                   `yaml:"log_reasoning_shorten,omitempty"`
@@ -390,13 +418,13 @@ func getRunConfig(cmd *cobra.Command, cfg *ConfigFile, modelname string) (RunCon
 	// 1. Initial values from flags (defaults or user-provided)
 	apiKey, _ := cmd.Flags().GetString("api-key")
 	apiBase, _ := cmd.Flags().GetString("api-base")
-	
+
 	var temperature *float64
 	if cmd.Flags().Changed("temperature") {
 		t, _ := cmd.Flags().GetFloat64("temperature")
 		temperature = &t
 	}
-	
+
 	timeoutSec, _ := cmd.Flags().GetInt("timeout")
 	seed, _ := cmd.Flags().GetInt("seed")
 	maxTokens, _ := cmd.Flags().GetInt("max_tokens")
@@ -545,6 +573,76 @@ func generateUUID() string {
 	return base64.URLEncoding.EncodeToString(u)
 }
 
+func sanitizeFilename(name string) string {
+	invalid := []string{"/", "\\", ":", "*", "?", "\"", "<", ">", "|", " "}
+	for _, char := range invalid {
+		name = strings.ReplaceAll(name, char, "_")
+	}
+	return name
+}
+
+func saveOutput(pathStr string, content string, modelName string) error {
+	cwd, _ := os.Getwd()
+	if pathStr == "." {
+		pathStr = cwd
+	}
+
+	// Check if pathStr looks like a directory or existing directory
+	info, err := os.Stat(pathStr)
+	isDir := (err == nil && info.IsDir()) || strings.HasSuffix(pathStr, string(os.PathSeparator)) || strings.HasSuffix(pathStr, "/")
+
+	var finalPath string
+
+	if isDir {
+		// Generate filename
+		timestamp := time.Now().Format("2006-01-02_15-04-05")
+		filename := fmt.Sprintf("%s_%s.md", sanitizeFilename(modelName), timestamp)
+		finalPath = filepath.Join(pathStr, filename)
+
+		// Ensure directory exists
+		if err := os.MkdirAll(pathStr, 0755); err != nil {
+			return err
+		}
+	} else {
+		finalPath = pathStr
+		// Ensure parent directory exists
+		dir := filepath.Dir(finalPath)
+		if dir != "." && dir != "/" {
+			if err := os.MkdirAll(dir, 0755); err != nil {
+				return err
+			}
+		}
+
+		// Ensure extension
+		if filepath.Ext(finalPath) == "" {
+			finalPath += ".md"
+		}
+	}
+
+	// Handle collision
+	base := strings.TrimSuffix(finalPath, filepath.Ext(finalPath))
+	ext := filepath.Ext(finalPath)
+
+	for i := 0; ; i++ {
+		target := finalPath
+		if i > 0 {
+			target = fmt.Sprintf("%s_%d%s", base, i, ext)
+		}
+
+		if _, err := os.Stat(target); os.IsNotExist(err) {
+			finalPath = target
+			break
+		}
+	}
+
+	if err := os.WriteFile(finalPath, []byte(content), 0644); err != nil {
+		return err
+	}
+
+	fmt.Fprintf(os.Stderr, "\nSaved output to %s\n", finalPath)
+	return nil
+}
+
 // Legacy dumpToHistory replaced by global historyMgr
 func dumpToHistory(session *Session, data interface{}) error {
 	return nil
@@ -593,7 +691,7 @@ func main() {
 
 	// Chat/IO
 	rootCmd.Flags().BoolP("chat", "c", false, "Launch chat mode")
-	rootCmd.Flags().Bool("chat-send", false, "Launch chat mode and send the first message right away")
+	rootCmd.Flags().BoolP("chat-send", "C", false, "Launch chat mode and send the first message right away")
 	rootCmd.Flags().BoolP("clipboard", "x", false, "Paste clipboard content as <user-clipboard-content>")
 	rootCmd.Flags().String("context-order", "append", "Context ordering for clipboard: prepend|append")
 	rootCmd.Flags().StringP("piped-wrapper", "w", "context", "Wrapper tag for piped stdin (empty string disables wrapping)")
@@ -601,7 +699,11 @@ func main() {
 	rootCmd.Flags().Bool("no-gitignore", false, "Do not ignore files matched by .gitignore")
 	rootCmd.Flags().Bool("no-ignored-files", false, "Do not ignore default large/unsuitable files (e.g. package-lock.json)")
 	rootCmd.Flags().StringP("context-format", "i", "md", "Context (files) input template format (md|xml)")
+	rootCmd.Flags().String("show-filenames", "relative", "How to show filenames (absolute|relative|name-only|none)")
+	rootCmd.Flags().Bool("context-armor", true, "Wrap context in <context> tags")
 	rootCmd.Flags().BoolP("auto", "A", false, "Auto-select files using LLM")
+	rootCmd.Flags().String("save-to", "", "Save output to file (dir or path). If flag is present but no value, defaults to CWD")
+	rootCmd.Flags().Lookup("save-to").NoOptDefVal = "."
 
 	// API/Debug
 	rootCmd.Flags().StringP("api-key", "k", "", "OpenAI API key")
@@ -623,9 +725,6 @@ func main() {
 
 	// Session Mode Flag
 	rootCmd.Flags().Bool("session", false, "Start a transparent shell session with '??' AI interception")
-
-	// Legacy
-	rootCmd.Flags().Lookup("chat-send").ShorthandDeprecated = "use --chat-send instead"
 
 	// NEW: Session Subcommand
 	sessionCmd := &cobra.Command{
@@ -680,6 +779,85 @@ func main() {
 		},
 	}
 	rootCmd.AddCommand(searchCmd)
+
+	// NEW: History Command
+	historyCmd := &cobra.Command{
+		Use:   "history",
+		Short: "Browse and resume recent chats",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if historyMgr == nil {
+				return fmt.Errorf("history manager not initialized")
+			}
+
+			sessions, err := historyMgr.ListRecentSessions(50)
+			if err != nil {
+				return err
+			}
+
+			if !is_interactive(os.Stdout.Fd()) {
+				for _, s := range sessions {
+					fmt.Printf("%s\t%s\t%s\t%s\n", s.UUID, s.Timestamp.Format("2006-01-02 15:04"), s.Model, s.Summary)
+				}
+				return nil
+			}
+
+			m := newHistoryModel(sessions)
+			p := tea.NewProgram(m, tea.WithAltScreen())
+			finalM, err := p.Run()
+			if err != nil {
+				return err
+			}
+
+			finalHistory := finalM.(historyModel)
+			if finalHistory.selected != nil {
+				// Resume logic
+				uuid := finalHistory.selected.UUID
+				msgs, err := historyMgr.GetSessionMessages(uuid)
+				if err != nil {
+					return fmt.Errorf("failed to load session: %w", err)
+				}
+
+				var llmMsgs []Message
+				for _, m := range msgs {
+					if m.Role == "__sys__" {
+						var sysOp map[string]string
+						if err := json.Unmarshal([]byte(m.Content), &sysOp); err == nil {
+							if sysOp["sysop"] == "remove_msg" {
+								targetID := sysOp["id"]
+								n := 0
+								for _, active := range llmMsgs {
+									if active.UUID != targetID {
+										llmMsgs[n] = active
+										n++
+									}
+								}
+								llmMsgs = llmMsgs[:n]
+							}
+						}
+						continue
+					}
+					llmMsgs = append(llmMsgs, Message{
+						Role:    m.Role,
+						Content: m.Content,
+						UUID:    m.UUID,
+					})
+				}
+
+				resumedMessages = llmMsgs
+				resumedSessionUUID = uuid
+				if !cmd.Flags().Changed("model") {
+					cmd.Flags().Set("model", finalHistory.selected.Model)
+				}
+				cmd.Flags().Set("chat", "true")
+
+				return runLLMChat(cmd, []string{})
+			}
+
+			return nil
+		},
+	}
+	historyCmd.Flags().AddFlagSet(rootCmd.Flags())
+	rootCmd.AddCommand(historyCmd)
 
 	// NEW: Doctor Subcommand (System Check)
 	doctorCmd := &cobra.Command{
@@ -934,6 +1112,11 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	contextOrder, _ := cmd.Flags().GetString("context-order")
 	pipedWrapper, _ := cmd.Flags().GetString("piped-wrapper")
 
+	contextArmor, _ := cmd.Flags().GetBool("context-armor")
+	if !cmd.Flags().Changed("context-armor") && cfg.ContextArmor != nil {
+		contextArmor = *cfg.ContextArmor
+	}
+
 	// Shell Assistant
 	shellMode, _ := cmd.Flags().GetBool("shell")
 	if shellMode {
@@ -1052,6 +1235,8 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	autoFlag, _ := cmd.Flags().GetBool("auto")
 	filesFlag, _ := cmd.Flags().GetStringSlice("files")
 	contextFormat, _ := cmd.Flags().GetString("context-format")
+	showFilenames, _ := cmd.Flags().GetString("show-filenames")
+	cwd, _ := os.Getwd()
 
 	// Construct initial user message to parse for @ tokens
 	var usermsg string = strings.Join(args, " ")
@@ -1187,7 +1372,8 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 
 		if len(fileContexts) > 0 {
 			// Full context for LLM
-			formattedContext := formatContext(fileContexts, contextFormat, -1)
+			// If armor is on, we don't want formatContext (XML) to include outer tags, we'll do it globally
+			formattedContext := formatContext(fileContexts, contextFormat, showFilenames, cwd, -1, !contextArmor)
 			contextBuilder.WriteString(formattedContext + "\n")
 
 			// Truncated context for debug output
@@ -1195,7 +1381,7 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 			if cfg.Context != nil && cfg.Context.DebugTruncateFiles != nil {
 				truncateLimit = *cfg.Context.DebugTruncateFiles
 			}
-			debugFormattedContext := formatContext(fileContexts, contextFormat, truncateLimit)
+			debugFormattedContext := formatContext(fileContexts, contextFormat, showFilenames, cwd, truncateLimit, !contextArmor)
 			debugContextBuilder.WriteString(debugFormattedContext + "\n")
 
 			hasContext = true
@@ -1215,10 +1401,16 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 		if pipedContent.Len() > 0 {
 			content := strings.TrimRight(pipedContent.String(), "\n")
 			if pipedWrapper != "" {
-				// Wrap with custom or default wrapper
-				formatted := fmt.Sprintf("<%s>\n%s\n</%s>\n", pipedWrapper, content, pipedWrapper)
-				contextBuilder.WriteString(formatted)
-				debugContextBuilder.WriteString(formatted)
+				// If armor is on and wrapper is "context", we avoid double wrapping
+				if contextArmor && pipedWrapper == "context" {
+					contextBuilder.WriteString(content + "\n")
+					debugContextBuilder.WriteString(content + "\n")
+				} else {
+					// Wrap with custom or default wrapper
+					formatted := fmt.Sprintf("<%s>\n%s\n</%s>\n", pipedWrapper, content, pipedWrapper)
+					contextBuilder.WriteString(formatted)
+					debugContextBuilder.WriteString(formatted)
+				}
 			} else {
 				// No wrapper - just raw content
 				contextBuilder.WriteString(content + "\n")
@@ -1247,7 +1439,7 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 
 	// 3. Shell History
 	if historyContext != "" {
-		// historyContext already has tags <context-user-shell-history>
+		// historyContext already has tags <user-shell-history> (not context-user-shell-history)
 		contextBuilder.WriteString(historyContext)
 		debugContextBuilder.WriteString(historyContext)
 		hasContext = true
@@ -1260,6 +1452,11 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	if hasContext {
 		fullContext := strings.TrimSpace(contextBuilder.String())
 		debugContext := strings.TrimSpace(debugContextBuilder.String())
+
+		if contextArmor {
+			fullContext = "<context>\n" + fullContext + "\n</context>"
+			debugContext = "<context>\n" + debugContext + "\n</context>"
+		}
 
 		if contextOrder == "append" {
 			if len(usermsg) > 0 {
@@ -1300,39 +1497,32 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	}
 
 	// Determine reasoning configuration with mutual exclusivity handling
-	var reasoningEffort string
 	var reasoningConfiguredMax int
 	var reasoningConfiguredExclude bool
 	reasoningFlagCount := 0
 
 	if noReasoning {
-		reasoningEffort = "none"
 		reasoningFlagCount++
 	}
 	if reasoningLow {
-		reasoningEffort = "low"
 		reasoningFlagCount++
 	}
 	if reasoningMedium {
-		reasoningEffort = "medium"
 		reasoningFlagCount++
 	}
 	if reasoningHigh {
-		reasoningEffort = "high"
 		reasoningFlagCount++
 	}
 	if reasoningXHigh {
-		reasoningEffort = "xhigh"
 		reasoningFlagCount++
 	}
 	if reasoningMax > 0 {
 		reasoningConfiguredMax = reasoningMax
-		reasoningFlagCount++
 	}
 
 	// Warn if multiple reasoning flags were specified
 	if reasoningFlagCount > 1 {
-		fmt.Fprintf(os.Stderr, "Warning: Multiple reasoning flags specified, using last-specified option\n")
+		fmt.Fprintf(os.Stderr, "Warning: Multiple reasoning effort flags specified, using last-specified option\n")
 	}
 
 	reasoningConfiguredExclude = reasoningExclude
@@ -1363,14 +1553,14 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 
 	// Only mark start if new session
 	if resumedSessionUUID == "" && !dryRun {
-		markChatStart(session, usermsg, systemPrompt, modelname, seed, temperature, apiBase, maxTokens, jsonMode, stopSeqInterface, extraParams, jsonSchema, reasoningEffort, reasoningConfiguredMax, reasoningConfiguredExclude)
+		markChatStart(session, usermsg, systemPrompt, modelname, seed, temperature, apiBase, maxTokens, jsonMode, stopSeqInterface, extraParams, jsonSchema, runCfg.ReasoningEffort, reasoningConfiguredMax, reasoningConfiguredExclude)
 	}
 
 	var extra map[string]interface{}
 
 	extraParamsMap := map[string]interface{}{}
 	if err := json.Unmarshal([]byte(extraParams), &extraParamsMap); err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("failed to parse extra params JSON: %w", err)
 	}
 
 	extra = map[string]interface{}{}
@@ -1439,15 +1629,21 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 
 	if dryRun {
 		// Construct full payload for display
+		displayMessages := make([]Message, len(messages))
+		copy(displayMessages, messages)
+		if len(usermsg) > 0 {
+			displayMessages = append(displayMessages, *NewMessage("user", usermsg))
+		}
+
 		req := LLMChatRequestBasic{
 			Model:       modelname,
 			Seed:        seed,
 			Temperature: temperature,
 			Stream:      stream,
-			Messages:    make([]LLMMessage, len(messages)),
+			Messages:    make([]LLMMessage, len(displayMessages)),
 		}
 		// convert messages
-		for i, m := range messages {
+		for i, m := range displayMessages {
 			req.Messages[i] = LLMMessage{Role: m.Role, Content: m.Content}
 		}
 
@@ -1505,7 +1701,7 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 			initialTextareaValue = usermsg
 		}
 
-		p := tea.NewProgram(initialModel(*session, messages, llmHistoryFunc, llmApiFunc, initialTextareaValue, chat_send), // use the full size of the terminal in its "alternate screen buffer"
+		p := tea.NewProgram(initialModel(*session, messages, llmHistoryFunc, llmApiFunc, initialTextareaValue, chat_send, modelname), // use the full size of the terminal in its "alternate screen buffer"
 			tea.WithMouseCellMotion())
 
 		if _, err := p.Run(); err != nil {
@@ -1563,6 +1759,10 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	var thinkingPrinted bool
 	var reasoningDone bool
 
+	// Output accumulation for --save-to
+	var contentBuffer strings.Builder
+	hasReasoning := false
+
 	// Timing Metrics
 	t_start := time.Now()
 	var t_ttft, t_reasoning_end time.Time
@@ -1578,10 +1778,16 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 		}
 
 		if event.Type == "reasoning" {
+			hasReasoning = true
 			if !ttft_set {
 				t_ttft = time.Now()
 				ttft_set = true
 			}
+
+			// Always track reasoning end time, even if not logging
+			// We update it on every reasoning token, the last one will be the end
+			t_reasoning_end = time.Now()
+
 			if !logReasoning {
 				continue
 			}
@@ -1616,13 +1822,35 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 				t_ttft = time.Now()
 				ttft_set = true
 			}
-			if logReasoning && thinkingPrinted && !reasoningDone {
-				t_reasoning_end = time.Now()
-				fmt.Print(thinkingEnd)
+
+			// Handle transition from reasoning to content
+			if hasReasoning && !reasoningDone {
+				// We might have updated t_reasoning_end in the loop above
+				// If we are logging, we print the end tag
+				if logReasoning && thinkingPrinted {
+					fmt.Print(thinkingEnd)
+				}
 				reasoningDone = true
 			}
+
 			tokens_gen += estimateTokens(event.Content)
 			fmt.Print(event.Content)
+			contentBuffer.WriteString(event.Content)
+		}
+	}
+
+	// Save to file if requested
+	saveTo, _ := cmd.Flags().GetString("save-to")
+	if saveTo != "" {
+		finalContent := contentBuffer.String()
+		if hasReasoning && !t_reasoning_end.IsZero() && !t_ttft.IsZero() {
+			duration := t_reasoning_end.Sub(t_ttft)
+			durStr := fmt.Sprintf("%dm%ds", int(duration.Minutes()), int(duration.Seconds())%60)
+			header := fmt.Sprintf("< thought for %s >\n\n", durStr)
+			finalContent = header + finalContent
+		}
+		if err := saveOutput(saveTo, finalContent, modelname); err != nil {
+			fmt.Fprintf(os.Stderr, "\nWarning: failed to save output: %v\n", err)
 		}
 	}
 
@@ -1653,7 +1881,6 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-
 type chatTuiState struct {
 	spin           bool
 	streaming      bool
@@ -1671,6 +1898,12 @@ type chatTuiState struct {
 	mdPaddingWidth int
 	shift          bool
 	sendRightAway  bool
+	modelName      string
+
+	// Reasoning
+	isReasoning    bool
+	reasoningText  string
+	reasoningStart time.Time
 
 	// Search Mode
 	inSearch   bool
@@ -1692,7 +1925,7 @@ func getLastMsg(m chatTuiState) (Message, error) {
 	return m.llmMessages[len(m.llmMessages)-1], nil
 }
 
-func initialModel(session Session, messages []Message, llmHistoryApi func(Message) error, llmApi func(messages []Message) (<-chan StreamEvent, error), initialTextareaValue string, sendRightAway bool) chatTuiState {
+func initialModel(session Session, messages []Message, llmHistoryApi func(Message) error, llmApi func(messages []Message) (<-chan StreamEvent, error), initialTextareaValue string, sendRightAway bool, modelName string) chatTuiState {
 	ta := textarea.New()
 	ta.Placeholder = "Type a message..."
 	ta.Focus()
@@ -1702,6 +1935,8 @@ func initialModel(session Session, messages []Message, llmHistoryApi func(Messag
 	ta.MaxHeight = 32
 	ta.FocusedStyle.CursorLine = lipgloss.NewStyle()
 	ta.ShowLineNumbers = false
+	// Violet cursor when reasoning/active
+	ta.Cursor.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("57"))
 
 	vp := viewport.New(32, 12)
 	vp.SetContent(`<llm chat history is empty>`)
@@ -1712,7 +1947,7 @@ func initialModel(session Session, messages []Message, llmHistoryApi func(Messag
 	ta.SetValue(initialTextareaValue)
 
 	if len(messages) > 0 {
-		vp.SetContent(formatMessageLog(messages, true, 80, 0, "", "", true))
+		vp.SetContent(formatMessageLog(messages, true, 80, 0, "", "", true, modelName))
 	}
 	vp.GotoBottom()
 
@@ -1740,6 +1975,7 @@ func initialModel(session Session, messages []Message, llmHistoryApi func(Messag
 		mdPaddingWidth: 0,
 		sendRightAway:  sendRightAway,
 		searchList:     searchList,
+		modelName:      modelName,
 	}
 }
 
@@ -1793,7 +2029,7 @@ var markdownCache = struct {
 }{cache: make(map[string]string)}
 
 func formatMessageLog(msgs []Message, renderMarkdown bool, lineWidth int,
-	mdPadding int, suffix string, roleFormat string, renderNewlinesInUsermsgs bool) string {
+	mdPadding int, suffix string, roleFormat string, renderNewlinesInUsermsgs bool, modelName string) string {
 
 	roleFmt := "### %s:\n"
 	if roleFormat != "" {
@@ -1804,6 +2040,13 @@ func formatMessageLog(msgs []Message, renderMarkdown bool, lineWidth int,
 
 	for i, msg := range msgs {
 		content := strings.TrimRight(msg.Content, " \t\r\n")
+
+		// Customize header for Assistant
+		currentRoleFmt := roleFmt
+		roleDisplay := strings.ToUpper(msg.Role)
+		if msg.Role == "assistant" && modelName != "" {
+			roleDisplay = fmt.Sprintf("ASSISTANT - %s", modelName)
+		}
 
 		if msg.Role == "user" && renderNewlinesInUsermsgs {
 			re := regexp.MustCompile(`(?m:^(  |\z)|\n)`)
@@ -1836,7 +2079,7 @@ func formatMessageLog(msgs []Message, renderMarkdown bool, lineWidth int,
 			sfx = suffix
 		}
 
-		fmt.Fprintf(&ret, roleFmt+"%s%s\n\n", strings.ToUpper(msg.Role), content, sfx)
+		fmt.Fprintf(&ret, currentRoleFmt+"%s%s\n\n", roleDisplay, content, sfx)
 	}
 
 	return ret.String()
@@ -1876,7 +2119,7 @@ func sendMsg(m chatTuiState, usermsg string) (tea.Model, tea.Cmd) {
 	m.textarea.Placeholder = TEXTINPUT_PLACEHOLDER
 	m.textarea.Focus()
 
-	m.viewport.SetContent(formatMessageLog(m.llmMessages, m.renderMarkdown, m.viewportWidth, m.mdPaddingWidth, m.spinner.View(), "", true))
+	m.viewport.SetContent(formatMessageLog(m.llmMessages, m.renderMarkdown, m.viewportWidth, m.mdPaddingWidth, m.spinner.View(), "", true, m.modelName))
 	m.viewport.GotoBottom()
 
 	return m, tea.Batch(m.spinner.Tick, readLLMResponse(m, m.ch))
@@ -1922,7 +2165,7 @@ func (m chatTuiState) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 									Role: mg.Role, Content: mg.Content, UUID: mg.UUID,
 								})
 							}
-							m.viewport.SetContent(formatMessageLog(m.llmMessages, m.renderMarkdown, m.viewportWidth, m.mdPaddingWidth, "", "", true))
+							m.viewport.SetContent(formatMessageLog(m.llmMessages, m.renderMarkdown, m.viewportWidth, m.mdPaddingWidth, "", "", true, m.modelName))
 							m.viewport.GotoBottom()
 						}
 					}
@@ -1990,7 +2233,7 @@ func (m chatTuiState) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case tea.KeyCtrlS:
 			if len(m.llmMessages) > 0 {
-				putTextIntoClipboard(formatMessageLog(m.llmMessages, false, 0, 0, "", "", false))
+				putTextIntoClipboard(formatMessageLog(m.llmMessages, false, 0, 0, "", "", false, m.modelName))
 			}
 			return m, nil
 
@@ -2003,7 +2246,7 @@ func (m chatTuiState) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.KeyCtrlD:
 			removeLastMsg(m)
 
-			m.viewport.SetContent(formatMessageLog(m.llmMessages, m.renderMarkdown, m.viewportWidth, m.mdPaddingWidth, "", "", true))
+			m.viewport.SetContent(formatMessageLog(m.llmMessages, m.renderMarkdown, m.viewportWidth, m.mdPaddingWidth, "", "", true, m.modelName))
 			m.viewport.GotoBottom()
 
 			return m, nil
@@ -2032,7 +2275,38 @@ func (m chatTuiState) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case updateViewportMsg:
 		content := msg.content
+		isReasoning := msg.isReasoning
 		streaming_done := !msg.streaming
+
+		// Handle Reasoning Start/Transition
+		if isReasoning {
+			if !m.isReasoning {
+				m.isReasoning = true
+				m.reasoningStart = time.Now()
+				m.reasoningText = ""
+			}
+			m.reasoningText += content
+
+			// Auto-scroll logic for viewport not needed as reasoning is external to viewport messages
+		} else {
+			// Content or Done
+			if m.isReasoning {
+				// Transition from reasoning to content
+				m.isReasoning = false
+				duration := time.Since(m.reasoningStart)
+				durStr := fmt.Sprintf("%dm%ds", int(duration.Minutes()), int(duration.Seconds())%60)
+
+				collapse := fmt.Sprintf("< thought for %s >\n\n", durStr)
+
+				// Prepend to assistant message if it exists, or start new
+				if len(m.llmMessages) > 0 && m.llmMessages[len(m.llmMessages)-1].Role == "assistant" {
+					m.llmMessages[len(m.llmMessages)-1].Content += collapse
+				} else {
+					m.llmMessages = append(m.llmMessages, *NewMessage("assistant", collapse))
+				}
+				m.reasoningText = ""
+			}
+		}
 
 		if m.spin {
 			m.spin = false
@@ -2042,17 +2316,33 @@ func (m chatTuiState) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		if streaming_done {
 			m.streaming = false
+			m.isReasoning = false // ensure closed
 			return m, nil
 		}
 
-		if len(m.llmMessages) > 0 && m.llmMessages[len(m.llmMessages)-1].Role == "assistant" {
-			m.llmMessages[len(m.llmMessages)-1].Content += content
-		} else {
-			m.llmMessages = append(m.llmMessages, *NewMessage("assistant", content))
-			m.spin = false
+		if !isReasoning {
+			if len(m.llmMessages) > 0 && m.llmMessages[len(m.llmMessages)-1].Role == "assistant" {
+				m.llmMessages[len(m.llmMessages)-1].Content += content
+			} else {
+				m.llmMessages = append(m.llmMessages, *NewMessage("assistant", content))
+				m.spin = false
+			}
 		}
 
-		m.viewport.SetContent(formatMessageLog(m.llmMessages, m.renderMarkdown, m.viewportWidth, m.mdPaddingWidth, "", "", true))
+		suffix := ""
+		if m.isReasoning {
+			// Render rolling reasoning log
+			reasoningStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#50C8FF"))
+			barStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#9D00FF"))
+			width := m.viewportWidth
+			if width <= 0 {
+				width = 80
+			}
+			bar := strings.Repeat("-", width)
+			suffix = fmt.Sprintf("\n%s\n%s\n%s", barStyle.Render(bar), reasoningStyle.Render(m.reasoningText), barStyle.Render(bar))
+		}
+
+		m.viewport.SetContent(formatMessageLog(m.llmMessages, m.renderMarkdown, m.viewportWidth, m.mdPaddingWidth, suffix, "", true, m.modelName))
 		m.viewport.GotoBottom()
 
 		return m, tea.Batch(tiCmd, vpCmd, spCmd, readLLMResponse(m, m.ch))
@@ -2075,7 +2365,18 @@ func (m chatTuiState) View() string {
 	}
 
 	if m.spin || m.streaming {
-		m.viewport.SetContent(formatMessageLog(m.llmMessages, m.renderMarkdown, m.viewportWidth, m.mdPaddingWidth, m.spinner.View(), "", true))
+		suffix := m.spinner.View()
+		if m.isReasoning {
+			reasoningStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#50C8FF"))
+			barStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#9D00FF"))
+			width := m.viewportWidth
+			if width <= 0 {
+				width = 80
+			}
+			bar := strings.Repeat("-", width)
+			suffix = fmt.Sprintf("\n%s\n%s\n%s", barStyle.Render(bar), reasoningStyle.Render(m.reasoningText), barStyle.Render(bar))
+		}
+		m.viewport.SetContent(formatMessageLog(m.llmMessages, m.renderMarkdown, m.viewportWidth, m.mdPaddingWidth, suffix, "", true, m.modelName))
 	}
 
 	return fmt.Sprintf(
@@ -2089,7 +2390,9 @@ func readLLMResponse(m chatTuiState, ch <-chan StreamEvent) tea.Cmd {
 	return func() tea.Msg {
 		for event := range ch {
 			if event.Type == "content" {
-				return updateViewportMsg{content: event.Content, streaming: true}
+				return updateViewportMsg{content: event.Content, streaming: true, isReasoning: false}
+			} else if event.Type == "reasoning" {
+				return updateViewportMsg{content: event.Content, streaming: true, isReasoning: true}
 			}
 		}
 		var lastMsg, err = getLastMsg(m)
@@ -2101,6 +2404,7 @@ func readLLMResponse(m chatTuiState, ch <-chan StreamEvent) tea.Cmd {
 }
 
 type updateViewportMsg struct {
-	streaming bool
-	content   string
+	streaming   bool
+	content     string
+	isReasoning bool
 }

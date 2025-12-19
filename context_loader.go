@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,6 +16,7 @@ type FileContext struct {
 	Path      string
 	Content   string
 	IsBinary  bool
+	IsImage   bool
 	Type      string // file extension or detected type
 	SizeBytes int64
 }
@@ -123,7 +125,7 @@ func (fl *FileLoader) ReadFile(path string) (*FileContext, error) {
 	// Check if file exists
 	info, err := os.Stat(absPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to stat %s: %w", absPath, err)
+		return nil, fmt.Errorf("file not found: %s", absPath)
 	}
 
 	// Skip directories
@@ -140,14 +142,9 @@ func (fl *FileLoader) ReadFile(path string) (*FileContext, error) {
 	// Check size limit
 	maxBytes := int64(fl.maxFileSizeKB) * 1024
 	if info.Size() > maxBytes {
-		if fl.verbose {
-			fmt.Fprintf(os.Stderr, "Warning: File %s exceeds size limit (%d KB), skipping\n",
-				absPath, fl.maxFileSizeKB)
-		}
-		ctx.IsBinary = true
-		ctx.Content = fmt.Sprintf("[File too large: %d KB, limit: %d KB]",
-			info.Size()/1024, fl.maxFileSizeKB)
-		return ctx, nil
+		// Size limit violation is an error in strict mode
+		return nil, fmt.Errorf("file too large: %s (%d KB exceeds limit %d KB)",
+			absPath, info.Size()/1024, fl.maxFileSizeKB)
 	}
 
 	// Open file
@@ -167,9 +164,26 @@ func (fl *FileLoader) ReadFile(path string) (*FileContext, error) {
 
 	// Check if binary
 	if isBinaryContent(header) {
-		ctx.IsBinary = true
-		ctx.Content = fmt.Sprintf("[Binary File: %s]", filepath.Base(absPath))
-		return ctx, nil
+		// Check for supported images
+		mime := http.DetectContentType(header)
+		if strings.HasPrefix(mime, "image/") {
+			ctx.IsImage = true
+			ctx.IsBinary = false
+
+			// Read rest of file
+			rest, err := io.ReadAll(file)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read image %s: %w", absPath, err)
+			}
+			fullContent := append(header, rest...)
+
+			b64 := base64.StdEncoding.EncodeToString(fullContent)
+			ctx.Content = fmt.Sprintf("data:%s;base64,%s", mime, b64)
+			return ctx, nil
+		}
+
+		// Other binary files are an error in strict mode
+		return nil, fmt.Errorf("binary files not allowed: %s", absPath)
 	}
 
 	// Read rest of file
@@ -196,10 +210,8 @@ func (fl *FileLoader) LoadAll(paths []string) ([]FileContext, error) {
 		// Resolve to absolute path for deduplication
 		absPath, err := filepath.Abs(p)
 		if err != nil {
-			if fl.verbose {
-				fmt.Fprintf(os.Stderr, "Warning: failed to resolve path %s: %v\n", p, err)
-			}
-			continue
+			// Fail immediately on path resolution error
+			return nil, fmt.Errorf("failed to resolve path %s: %w", p, err)
 		}
 
 		if !seen[absPath] {
@@ -216,17 +228,10 @@ func (fl *FileLoader) LoadAll(paths []string) ([]FileContext, error) {
 		ctx, err := fl.ReadFile(path)
 		if err != nil {
 			loadErrors = append(loadErrors, fmt.Sprintf("%s: %v", path, err))
-			if fl.verbose {
-				fmt.Fprintf(os.Stderr, "Warning: failed to load %s: %v\n", path, err)
-			}
-			continue
+			// Fail immediately on file read error
+			return nil, fmt.Errorf("failed to load %s: %w", path, err)
 		}
 		contexts = append(contexts, *ctx)
-	}
-
-	// If all files failed to load, return error
-	if len(contexts) == 0 && len(loadErrors) > 0 {
-		return nil, fmt.Errorf("failed to load any files: %s", strings.Join(loadErrors, "; "))
 	}
 
 	return contexts, nil

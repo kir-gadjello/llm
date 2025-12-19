@@ -32,9 +32,10 @@ type MessageEvent struct {
 
 // ChatMessage matches the internal Message struct
 type ChatMessage struct {
-	UUID    string `json:"uuid"`
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	UUID    string   `json:"uuid"`
+	Role    string   `json:"role"`
+	Content string   `json:"content"`
+	Images  []string `json:"images,omitempty"`
 }
 
 // ShellEvent represents session interception events

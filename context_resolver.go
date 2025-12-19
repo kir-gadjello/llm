@@ -288,13 +288,9 @@ func (pr *PathResolver) Resolve(patterns []string, useGitignore bool, useDefault
 		}
 	}
 
-	// If we had errors but also got some paths, just warn
-	if len(errors) > 0 && len(unique) == 0 {
+	// Strict mode: if any path failed to resolve, fail the entire operation
+	if len(errors) > 0 {
 		return nil, fmt.Errorf("failed to resolve paths: %s", strings.Join(errors, "; "))
-	}
-
-	if len(errors) > 0 && pr.verbose {
-		fmt.Fprintf(os.Stderr, "Warnings during path resolution: %s\n", strings.Join(errors, "; "))
 	}
 
 	return unique, nil

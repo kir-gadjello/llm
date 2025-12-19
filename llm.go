@@ -58,9 +58,10 @@ func displayTimings(t Timings) {
 }
 
 type Message struct {
-	UUID    string `json:"uuid"`
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	UUID    string   `json:"uuid"`
+	Role    string   `json:"role"`
+	Content string   `json:"content"`
+	Images  []string `json:"images,omitempty"`
 }
 
 func NewMessage(role, content string) *Message {
@@ -73,8 +74,9 @@ func NewMessage(role, content string) *Message {
 	}
 }
 
-func formatContext(files []FileContext, format string, filenameMode string, cwd string, truncateLimit int, useOuterTags bool) string {
+func formatContext(files []FileContext, format string, filenameMode string, cwd string, truncateLimit int, useOuterTags bool) (string, []string) {
 	var buf strings.Builder
+	var images []string
 
 	for _, f := range files {
 		displayPath := f.Path
@@ -95,7 +97,10 @@ func formatContext(files []FileContext, format string, filenameMode string, cwd 
 			if displayPath != "" {
 				buf.WriteString(fmt.Sprintf("File: %s\n", displayPath))
 			}
-			if f.IsBinary {
+			if f.IsImage {
+				buf.WriteString(fmt.Sprintf("[Image: %s]\n", displayPath))
+				images = append(images, f.Content)
+			} else if f.IsBinary {
 				buf.WriteString("[Binary File]\n")
 			} else {
 				content := f.Content
@@ -120,7 +125,10 @@ func formatContext(files []FileContext, format string, filenameMode string, cwd 
 			} else {
 				buf.WriteString("<file>\n")
 			}
-			if f.IsBinary {
+			if f.IsImage {
+				buf.WriteString(fmt.Sprintf("[Image: %s]\n", displayPath))
+				images = append(images, f.Content)
+			} else if f.IsBinary {
 				buf.WriteString("[Binary File]\n")
 			} else {
 				content := f.Content
@@ -141,12 +149,12 @@ func formatContext(files []FileContext, format string, filenameMode string, cwd 
 		// If using outer tags (armor disabled or implicit), wrap in context
 		// Otherwise just return the files block to be wrapped by global armor
 		if useOuterTags {
-			return "<context>\n<files>\n" + inner + "</files>\n</context>"
+			return "<context>\n<files>\n" + inner + "</files>\n</context>", images
 		}
-		return "<files>\n" + inner + "</files>\n"
+		return "<files>\n" + inner + "</files>\n", images
 	}
 
-	return buf.String()
+	return buf.String(), images
 }
 
 type ModelConfig struct {
@@ -1257,9 +1265,7 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	// Resolve paths (expand globs, git aliases, etc)
 	resolvedPaths, err := resolver.Resolve(allPaths, !noGitignore, !noDefaultIgnore)
 	if err != nil {
-		if verbose {
-			fmt.Fprintf(os.Stderr, "Warning: path resolution error: %v\n", err)
-		}
+		return err
 	}
 
 	// Auto-Mode
@@ -1353,6 +1359,7 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	// === Context Collection ===
 	var contextBuilder strings.Builder
 	var debugContextBuilder strings.Builder
+	var collectedImages []string
 	hasContext := false
 
 	// 0. File Context
@@ -1365,23 +1372,22 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 		loader := NewFileLoader(maxSizeKB, verbose)
 		fileContexts, err := loader.LoadAll(resolvedPaths)
 		if err != nil {
-			if verbose {
-				fmt.Fprintf(os.Stderr, "Warning: failed to load files: %v\n", err)
-			}
+			return err
 		}
 
 		if len(fileContexts) > 0 {
 			// Full context for LLM
 			// If armor is on, we don't want formatContext (XML) to include outer tags, we'll do it globally
-			formattedContext := formatContext(fileContexts, contextFormat, showFilenames, cwd, -1, !contextArmor)
+			formattedContext, images := formatContext(fileContexts, contextFormat, showFilenames, cwd, -1, !contextArmor)
 			contextBuilder.WriteString(formattedContext + "\n")
+			collectedImages = append(collectedImages, images...)
 
 			// Truncated context for debug output
 			truncateLimit := 10 // Default 10 lines
 			if cfg.Context != nil && cfg.Context.DebugTruncateFiles != nil {
 				truncateLimit = *cfg.Context.DebugTruncateFiles
 			}
-			debugFormattedContext := formatContext(fileContexts, contextFormat, showFilenames, cwd, truncateLimit, !contextArmor)
+			debugFormattedContext, _ := formatContext(fileContexts, contextFormat, showFilenames, cwd, truncateLimit, !contextArmor)
 			debugContextBuilder.WriteString(debugFormattedContext + "\n")
 
 			hasContext = true
@@ -1533,8 +1539,8 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 		cTokens := estimateTokens(contextBuilder.String())
 		fmt.Printf("\n--- LLM Request Stats ---\n")
 		fmt.Printf("Model:  %s\n", modelname)
-		fmt.Printf("Tokens: System: ~%d | Prompt: ~%d | Context: ~%d | Total: ~%d\n",
-			sTokens, pTokens, cTokens, sTokens+pTokens+cTokens)
+		fmt.Printf("Tokens: System: ~%d | Prompt: ~%d | Context: ~%d | Images: %d | Total: ~%d\n",
+			sTokens, pTokens, cTokens, len(collectedImages), sTokens+pTokens+cTokens+(len(collectedImages)*1000))
 		tempVal := 0.0
 		if temperature != nil {
 			tempVal = *temperature
@@ -1632,7 +1638,9 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 		displayMessages := make([]Message, len(messages))
 		copy(displayMessages, messages)
 		if len(usermsg) > 0 {
-			displayMessages = append(displayMessages, *NewMessage("user", usermsg))
+			msg := NewMessage("user", usermsg)
+			msg.Images = collectedImages
+			displayMessages = append(displayMessages, *msg)
 		}
 
 		req := LLMChatRequestBasic{
@@ -1644,7 +1652,20 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 		}
 		// convert messages
 		for i, m := range displayMessages {
-			req.Messages[i] = LLMMessage{Role: m.Role, Content: m.Content}
+			if len(m.Images) > 0 {
+				parts := []ContentPart{
+					{Type: "text", Text: m.Content},
+				}
+				for _, img := range m.Images {
+					parts = append(parts, ContentPart{
+						Type: "image_url",
+						ImageUrl: &ImageUrl{Url: img},
+					})
+				}
+				req.Messages[i] = LLMMessage{Role: m.Role, Content: parts}
+			} else {
+				req.Messages[i] = LLMMessage{Role: m.Role, Content: m.Content}
+			}
 		}
 
 		mergedData := map[string]interface{}{}
@@ -1668,9 +1689,25 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	llmApiFunc := func(messages []Message) (<-chan StreamEvent, error) {
 		filteredMessages := make([]LLMMessage, len(messages))
 		for i, msg := range messages {
-			filteredMessages[i] = LLMMessage{
-				Role:    msg.Role,
-				Content: msg.Content,
+			if len(msg.Images) > 0 {
+				parts := []ContentPart{
+					{Type: "text", Text: msg.Content},
+				}
+				for _, img := range msg.Images {
+					parts = append(parts, ContentPart{
+						Type: "image_url",
+						ImageUrl: &ImageUrl{Url: img},
+					})
+				}
+				filteredMessages[i] = LLMMessage{
+					Role:    msg.Role,
+					Content: parts,
+				}
+			} else {
+				filteredMessages[i] = LLMMessage{
+					Role:    msg.Role,
+					Content: msg.Content,
+				}
 			}
 		}
 		return llmChat(ctx, filteredMessages, modelname, seed, temperature, nil, apiKey, apiBase, stream, extra, verbose)
@@ -1688,6 +1725,7 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 				UUID:    msg.UUID,
 				Role:    msg.Role,
 				Content: msg.Content,
+				Images:  msg.Images,
 			},
 		}
 		return historyMgr.SaveMessage(data)
@@ -1713,7 +1751,9 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	}
 
 	if len(usermsg) > 0 {
-		messages = append(messages, *NewMessage("user", usermsg))
+		msg := NewMessage("user", usermsg)
+		msg.Images = collectedImages
+		messages = append(messages, *msg)
 	}
 
 	var timings Timings

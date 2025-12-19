@@ -30,8 +30,18 @@ type LLMChatRequestBasic struct {
 }
 
 type LLMMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role    string      `json:"role"`
+	Content interface{} `json:"content"`
+}
+
+type ContentPart struct {
+	Type     string    `json:"type"`
+	Text     string    `json:"text,omitempty"`
+	ImageUrl *ImageUrl `json:"image_url,omitempty"`
+}
+
+type ImageUrl struct {
+	Url string `json:"url"`
 }
 
 func resolveLLMApi(apiKey string, apiBase string) (string, string, error) {

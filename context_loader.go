@@ -23,19 +23,25 @@ type FileContext struct {
 
 // FileLoader handles safe file loading with binary detection
 type FileLoader struct {
-	maxFileSizeKB int
-	verbose       bool
+    maxFileSizeKB     int
+    maxImageSizeKB    int
+    verbose           bool
 }
 
 // NewFileLoader creates a new file loader with the given size limit
-func NewFileLoader(maxFileSizeKB int, verbose bool) *FileLoader {
-	if maxFileSizeKB <= 0 {
-		maxFileSizeKB = 1024 // default 1MB
-	}
-	return &FileLoader{
-		maxFileSizeKB: maxFileSizeKB,
-		verbose:       verbose,
-	}
+func NewFileLoader(maxFileSizeKB int, maxImageSizeKB int, verbose bool) *FileLoader {
+    if maxFileSizeKB <= 0 {
+        maxFileSizeKB = 1024 // default 1MB for non-image files
+    }
+    // Default image size to 10MB if not provided
+    if maxImageSizeKB <= 0 {
+        maxImageSizeKB = 10240 // 10 MB
+    }
+    return &FileLoader{
+        maxFileSizeKB:   maxFileSizeKB,
+        maxImageSizeKB:  maxImageSizeKB,
+        verbose:         verbose,
+    }
 }
 
 // isBinaryContent checks if content contains binary data
@@ -139,58 +145,71 @@ func (fl *FileLoader) ReadFile(path string) (*FileContext, error) {
 		SizeBytes: info.Size(),
 	}
 
-	// Check size limit
-	maxBytes := int64(fl.maxFileSizeKB) * 1024
-	if info.Size() > maxBytes {
-		// Size limit violation is an error in strict mode
-		return nil, fmt.Errorf("file too large: %s (%d KB exceeds limit %d KB)",
-			absPath, info.Size()/1024, fl.maxFileSizeKB)
-	}
+    // Check size limit (use image-specific limit if the file is an image)
+    // We need to detect early if this is likely an image; read header first and detect MIME.
+    // To avoid duplicating detection logic, we read header now for binary/image detection.
+    file, err := os.Open(absPath)
+    if err != nil {
+        return nil, fmt.Errorf("failed to open %s: %w", absPath, err)
+    }
+    defer file.Close()
+
+    // Read first 512 bytes for MIME detection
+    header := make([]byte, 512)
+    n, err := file.Read(header)
+    if err != nil && err != io.EOF {
+        return nil, fmt.Errorf("failed to read header from %s: %w", absPath, err)
+    }
+    header = header[:n]
+
+    // Detect MIME type
+    mime := http.DetectContentType(header)
+    isImage := strings.HasPrefix(mime, "image/")
+
+    // Apply size limit
+    var maxBytes int64
+    if isImage {
+        maxBytes = int64(fl.maxImageSizeKB) * 1024
+        if info.Size() > maxBytes {
+            return nil, fmt.Errorf("image too large: %s (%d KB exceeds limit %d KB)",
+                absPath, info.Size()/1024, fl.maxImageSizeKB)
+        }
+    } else {
+        maxBytes = int64(fl.maxFileSizeKB) * 1024
+        if info.Size() > maxBytes {
+            return nil, fmt.Errorf("file too large: %s (%d KB exceeds limit %d KB)",
+                absPath, info.Size()/1024, fl.maxFileSizeKB)
+        }
+    }
 
 	// Open file
-	file, err := os.Open(absPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open %s: %w", absPath, err)
-	}
-	defer file.Close()
+    // Handle binary/image vs text
+    if isBinaryContent(header) {
+        if isImage {
+            ctx.IsImage = true
+            ctx.IsBinary = false
 
-	// Read first 512 bytes for binary detection
-	header := make([]byte, 512)
-	n, err := file.Read(header)
-	if err != nil && err != io.EOF {
-		return nil, fmt.Errorf("failed to read header from %s: %w", absPath, err)
-	}
-	header = header[:n]
+            // Read rest of file (continue from current offset)
+            rest, err := io.ReadAll(file)
+            if err != nil {
+                return nil, fmt.Errorf("failed to read image %s: %w", absPath, err)
+            }
+            fullContent := append(header, rest...)
 
-	// Check if binary
-	if isBinaryContent(header) {
-		// Check for supported images
-		mime := http.DetectContentType(header)
-		if strings.HasPrefix(mime, "image/") {
-			ctx.IsImage = true
-			ctx.IsBinary = false
+            b64 := base64.StdEncoding.EncodeToString(fullContent)
+            ctx.Content = fmt.Sprintf("data:%s;base64,%s", mime, b64)
+            return ctx, nil
+        }
 
-			// Read rest of file
-			rest, err := io.ReadAll(file)
-			if err != nil {
-				return nil, fmt.Errorf("failed to read image %s: %w", absPath, err)
-			}
-			fullContent := append(header, rest...)
+        // Other binary files are an error in strict mode
+        return nil, fmt.Errorf("binary files not allowed: %s", absPath)
+    }
 
-			b64 := base64.StdEncoding.EncodeToString(fullContent)
-			ctx.Content = fmt.Sprintf("data:%s;base64,%s", mime, b64)
-			return ctx, nil
-		}
-
-		// Other binary files are an error in strict mode
-		return nil, fmt.Errorf("binary files not allowed: %s", absPath)
-	}
-
-	// Read rest of file
-	rest, err := io.ReadAll(file)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read %s: %w", absPath, err)
-	}
+    // Read rest of file (text)
+    rest, err := io.ReadAll(file)
+    if err != nil {
+        return nil, fmt.Errorf("failed to read %s: %w", absPath, err)
+    }
 
 	// Combine header and rest
 	fullContent := append(header, rest...)

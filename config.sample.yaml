@@ -66,6 +66,8 @@ context:
   
   # Maximum file size to load (in KB)
   max_file_size_kb: 1024
+  # Optional separate limit for images (default 10MB if omitted)
+  max_image_size_kb: 10240
   
   # Maximum number of files to include in repo map
   max_repo_files: 1000

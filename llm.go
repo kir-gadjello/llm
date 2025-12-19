@@ -182,6 +182,8 @@ type ShellConfig struct {
 type ContextConfig struct {
 	AutoSelectorModel  *string  `yaml:"auto_selector_model,omitempty"`
 	MaxFileSizeKB      *int     `yaml:"max_file_size_kb,omitempty"`
+	// Optional separate limit for images (default 10MB)
+	MaxImageSizeKB     *int     `yaml:"max_image_size_kb,omitempty"`
 	MaxRepoFiles       *int     `yaml:"max_repo_files,omitempty"`
 	IgnoredDirs        []string `yaml:"ignored_dirs,omitempty"`
 	DebugTruncateFiles *int     `yaml:"debug_truncate_files,omitempty"`
@@ -1364,12 +1366,17 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 
 	// 0. File Context
 	if len(resolvedPaths) > 0 {
-		maxSizeKB := 1024
-		if cfg.Context != nil && cfg.Context.MaxFileSizeKB != nil {
-			maxSizeKB = *cfg.Context.MaxFileSizeKB
-		}
+	maxSizeKB := 1024
+	if cfg.Context != nil && cfg.Context.MaxFileSizeKB != nil {
+		maxSizeKB = *cfg.Context.MaxFileSizeKB
+	}
 
-		loader := NewFileLoader(maxSizeKB, verbose)
+	maxImageSizeKB := 10240 // default 10MB
+	if cfg.Context != nil && cfg.Context.MaxImageSizeKB != nil {
+		maxImageSizeKB = *cfg.Context.MaxImageSizeKB
+	}
+
+		loader := NewFileLoader(maxSizeKB, maxImageSizeKB, verbose)
 		fileContexts, err := loader.LoadAll(resolvedPaths)
 		if err != nil {
 			return err

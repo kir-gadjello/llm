@@ -275,6 +275,8 @@ context:
   max_file_size_kb: 1024                      # Skip files larger than this
   max_repo_files: 1000                        # Max files in repo map
   ignored_dirs: [".git", "node_modules", "dist", "vendor", "__pycache__"]
+  max_file_size_kb: 1024                      # Limit for non-image files (default 1 MB)
+  max_image_size_kb: 10240                    # Limit for images (default 10 MB)
   debug_truncate_files: 10                    # Truncate file context in debug output
 ```
 
@@ -303,7 +305,8 @@ Use with `-m <profile>`. CLI flags override config values.
 
 **Context configuration (`context`):**
 - `auto_selector_model`: model to use for `-A` auto-selection (empty = use main model)
-- `max_file_size_kb`: maximum file size to load (default: 1024 KB)
+- `max_file_size_kb`: maximum file size to load for non-image files (default: 1024 KB)
+- `max_image_size_kb`: maximum file size to load for image files (default: 10240 KB)
 - `max_repo_files`: maximum number of files to include in repo map (default: 1000)
 - `ignored_dirs`: directories to skip when generating repo maps
 - `debug_truncate_files`: number of lines to show per file in debug output (default: 10)

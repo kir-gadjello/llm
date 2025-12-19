@@ -714,6 +714,9 @@ func main() {
 	rootCmd.Flags().BoolP("auto", "A", false, "Auto-select files using LLM")
 	rootCmd.Flags().String("save-to", "", "Save output to file (dir or path). If flag is present but no value, defaults to CWD")
 	rootCmd.Flags().Lookup("save-to").NoOptDefVal = "."
+	// Image preview flags
+	rootCmd.Flags().Bool("image-log", true, "Preview images sent to model in terminal (if supported)")
+	rootCmd.Flags().Bool("no-image-log", false, "Disable image preview in terminal")
 
 	// API/Debug
 	rootCmd.Flags().StringP("api-key", "k", "", "OpenAI API key")
@@ -1126,6 +1129,12 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	if !cmd.Flags().Changed("context-armor") && cfg.ContextArmor != nil {
 		contextArmor = *cfg.ContextArmor
 	}
+	imageLog, _ := cmd.Flags().GetBool("image-log")
+	if cmd.Flags().Changed("no-image-log") {
+		if noImageLog, _ := cmd.Flags().GetBool("no-image-log"); noImageLog {
+			imageLog = false
+		}
+	}
 
 	// Shell Assistant
 	shellMode, _ := cmd.Flags().GetBool("shell")
@@ -1385,9 +1394,23 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 		if len(fileContexts) > 0 {
 			// Full context for LLM
 			// If armor is on, we don't want formatContext (XML) to include outer tags, we'll do it globally
-			formattedContext, images := formatContext(fileContexts, contextFormat, showFilenames, cwd, -1, !contextArmor)
-			contextBuilder.WriteString(formattedContext + "\n")
-			collectedImages = append(collectedImages, images...)
+				formattedContext, images := formatContext(fileContexts, contextFormat, showFilenames, cwd, -1, !contextArmor)
+				contextBuilder.WriteString(formattedContext + "\n")
+				collectedImages = append(collectedImages, images...)
+
+				// Preview images in terminal (if enabled and supported)
+				if imageLog && len(collectedImages) > 0 && is_interactive(os.Stdout.Fd()) {
+					if detectTerminalImageSupport() {
+						fmt.Fprintf(os.Stderr, "\033[36m[Image Preview]\033[0m Sending %d image(s) to model:\n", len(collectedImages))
+						for i, img := range collectedImages {
+							if err := displayImageInTerminal(img, 400); err != nil {
+								fmt.Fprintf(os.Stderr, "\033[33mWarning: failed to display image %d: %v\033[0m\n", i+1, err)
+							} else {
+								fmt.Fprintln(os.Stderr)
+							}
+						}
+					}
+				}
 
 			// Truncated context for debug output
 			truncateLimit := 10 // Default 10 lines

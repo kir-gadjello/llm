@@ -102,6 +102,24 @@ pbcopy < file.txt && llm -x "review this"
 llm -x --context-order append "context after prompt"
 ```
 
+### Image Preview in Terminal
+
+If your terminal supports inline images (iTerm2, WezTerm, Kitty, Alacritty, Windows Terminal), the CLI can preview images sent to the model for confirmation. This is enabled by default and can be disabled with `--no-image-log`.
+
+```bash
+# Preview included images (e.g., via -f)
+llm -f diagram.png "explain this diagram"
+
+# Disable preview
+llm -f diagram.png --no-image-log "explain this diagram"
+```
+
+- Behavior:
+- Automatic detection via `ITERM_SESSION_ID`, `TERM_PROGRAM`, and `TERM` heuristics for iTerm2, WezTerm, Kitty, Alacritty, and Windows Terminal.
+- Unsupported terminals will silently skip preview (no errors).
+- Resizes images to max height 400px while preserving aspect ratio before display.
+
+
 ### Context Formatting
 
 Control how files are presented to the model:

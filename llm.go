@@ -34,6 +34,7 @@ import (
 
 var TEXTINPUT_PLACEHOLDER = "Type a message and press Enter to send..."
 
+var Version = "dev"
 var startTime = time.Now()
 var historyMgr *history.Manager
 
@@ -767,6 +768,16 @@ func main() {
 	}
 	rootCmd.AddCommand(integrationCmd)
 
+	// NEW: Version Command
+	versionCmd := &cobra.Command{
+		Use:   "version",
+		Short: "Print the version number of llm",
+		Run: func(cmd *cobra.Command, args []string) {
+			fmt.Printf("llm version %s\n", Version)
+		},
+	}
+	rootCmd.AddCommand(versionCmd)
+
 	// NEW: Search Subcommand
 	searchCmd := &cobra.Command{
 		Use:   "search [query]",
@@ -1310,45 +1321,49 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 			// Start pulsating magenta color animation (Bubble Tea style)
 			stopAnimation := make(chan bool)
 			var animWg sync.WaitGroup
-			animWg.Add(1)
-			go func() {
-				defer animWg.Done()
-				// Magenta color gradient for smooth pulsation (256-color ANSI)
-				// Creates breathing effect from dim to bright magenta
-				colorFrames := []string{
-					"\033[38;5;126m", // Dim magenta
-					"\033[38;5;162m", // Medium-dim magenta
-					"\033[38;5;198m", // Medium magenta
-					"\033[38;5;199m", // Medium-bright magenta
-					"\033[38;5;200m", // Bright magenta
-					"\033[38;5;201m", // Very bright magenta
-					"\033[38;5;200m", // Bright magenta (reverse)
-					"\033[38;5;199m", // Medium-bright magenta (reverse)
-					"\033[38;5;198m", // Medium magenta (reverse)
-					"\033[38;5;162m", // Medium-dim magenta (reverse)
-				}
-				frameIdx := 0
-				reset := "\033[0m"
-				for {
-					select {
-					case <-stopAnimation:
-						fmt.Fprintf(os.Stderr, "\r\033[K") // Clear line
-						return
-					case <-time.After(120 * time.Millisecond):
-						color := colorFrames[frameIdx]
-						fmt.Fprintf(os.Stderr, "\r%s■ analyzing...%s", color, reset)
-						frameIdx = (frameIdx + 1) % len(colorFrames)
+			if !verbose {
+				animWg.Add(1)
+				go func() {
+					defer animWg.Done()
+					// Magenta color gradient for smooth pulsation (256-color ANSI)
+					// Creates breathing effect from dim to bright magenta
+					colorFrames := []string{
+						"\033[38;5;126m", // Dim magenta
+						"\033[38;5;162m", // Medium-dim magenta
+						"\033[38;5;198m", // Medium magenta
+						"\033[38;5;199m", // Medium-bright magenta
+						"\033[38;5;200m", // Bright magenta
+						"\033[38;5;201m", // Very bright magenta
+						"\033[38;5;200m", // Bright magenta (reverse)
+						"\033[38;5;199m", // Medium-bright magenta (reverse)
+						"\033[38;5;198m", // Medium magenta (reverse)
+						"\033[38;5;162m", // Medium-dim magenta (reverse)
 					}
-				}
-			}()
+					frameIdx := 0
+					reset := "\033[0m"
+					for {
+						select {
+						case <-stopAnimation:
+							fmt.Fprintf(os.Stderr, "\r\033[K") // Clear line
+							return
+						case <-time.After(120 * time.Millisecond):
+							color := colorFrames[frameIdx]
+							fmt.Fprintf(os.Stderr, "\r%s■ analyzing...%s", color, reset)
+							frameIdx = (frameIdx + 1) % len(colorFrames)
+						}
+					}
+				}()
+			}
 
 			// Use resolved API key/base for selector if needed, or default to main
 			// Note: We use the main model's config for the selector for now
 			autoPaths, err := selector.SelectFiles(usermsg, repoMap, selectorModel, apiKey, apiBase, debug)
 
 			// Stop animation
-			close(stopAnimation)
-			animWg.Wait()
+			if !verbose {
+				close(stopAnimation)
+				animWg.Wait()
+			}
 
 			if err != nil {
 				if verbose {
@@ -1590,6 +1605,24 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	// Only mark start if new session
 	if resumedSessionUUID == "" && !dryRun {
 		markChatStart(session, usermsg, systemPrompt, modelname, seed, temperature, apiBase, maxTokens, jsonMode, stopSeqInterface, extraParams, jsonSchema, runCfg.ReasoningEffort, reasoningConfiguredMax, reasoningConfiguredExclude)
+	} else if resumedSessionUUID != "" && !dryRun && len(usermsg) > 0 {
+		// If resuming, explicitly save the user message to history
+		// We can get the UUID from the last message added to 'messages'
+		// Note: messages slice isn't appended yet with usermsg, but we can save it now.
+		if historyMgr != nil {
+			historyMgr.SaveMessage(history.MessageEvent{
+				SID: session.UUID,
+				TS:  time.Now().Unix(),
+				Message: history.ChatMessage{
+					UUID:    generateUUID(),
+					Role:    "user",
+					Content: usermsg,
+					// Images not supported in resume persistence logic yet as collectedImages are separate
+					// But we can add them if needed. collectedImages is available.
+					Images: collectedImages,
+				},
+			})
+		}
 	}
 
 	var extra map[string]interface{}
@@ -1906,6 +1939,22 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 			tokens_gen += estimateTokens(event.Content)
 			fmt.Print(event.Content)
 			contentBuffer.WriteString(event.Content)
+		}
+	}
+
+	// Save assistant response to history
+	fullResponse := contentBuffer.String()
+	if !dryRun && len(fullResponse) > 0 {
+		if historyMgr != nil {
+			historyMgr.SaveMessage(history.MessageEvent{
+				SID: session.UUID,
+				TS:  time.Now().Unix(),
+				Message: history.ChatMessage{
+					UUID:    generateUUID(),
+					Role:    "assistant",
+					Content: fullResponse,
+				},
+			})
 		}
 	}
 

@@ -174,6 +174,7 @@ type ModelConfig struct {
 	ExtraBody          map[string]interface{} `yaml:"extra_body,omitempty"`
 	Extend             *string                `yaml:"extend,omitempty"`
 	Aliases            []string               `yaml:"aliases,omitempty"`
+	Fallback           []string               `yaml:"fallback,omitempty"`
 }
 
 type ShellConfig struct {
@@ -398,6 +399,10 @@ func resolveModelConfigRec(cfg *ConfigFile, modelName string, visited map[string
 
 		merged.ExtraBody = mergeMaps(merged.ExtraBody, modelCfg.ExtraBody)
 
+		if len(modelCfg.Fallback) > 0 {
+			merged.Fallback = modelCfg.Fallback
+		}
+
 		// Extend is handled by the recursion, so we don't need to copy it,
 		// but for correctness of the struct state, we can leave it or clear it.
 		// Let's keep the child's extend value.
@@ -423,6 +428,7 @@ type RunConfig struct {
 	Verbosity          string
 	ContextOrder       string
 	ExtraBody          map[string]interface{}
+	Fallback           []string
 }
 
 func getRunConfig(cmd *cobra.Command, cfg *ConfigFile, modelname string) (RunConfig, error) {
@@ -471,6 +477,7 @@ func getRunConfig(cmd *cobra.Command, cfg *ConfigFile, modelname string) (RunCon
 	}
 
 	extraBody := make(map[string]interface{})
+	var fallback []string
 
 	// 2. Resolve Model Config from file
 	// Default timeout: 3000 seconds (50 minutes) if not specified anywhere
@@ -532,6 +539,10 @@ func getRunConfig(cmd *cobra.Command, cfg *ConfigFile, modelname string) (RunCon
 				contextOrder = *resolvedCfg.ContextOrder
 			}
 
+			if len(resolvedCfg.Fallback) > 0 {
+				fallback = resolvedCfg.Fallback
+			}
+
 			// Merge ExtraBody
 			if resolvedCfg.ExtraBody != nil {
 				extraBody = mergeMaps(extraBody, resolvedCfg.ExtraBody)
@@ -558,6 +569,7 @@ func getRunConfig(cmd *cobra.Command, cfg *ConfigFile, modelname string) (RunCon
 		Verbosity:          verbosity,
 		ContextOrder:       contextOrder,
 		ExtraBody:          extraBody,
+		Fallback:           fallback,
 	}, nil
 }
 
@@ -1068,6 +1080,236 @@ func estimateTokens(text string) int {
 	return len(strings.Fields(text))
 }
 
+func resolvePrompt(input string) string {
+	if input == "" {
+		return ""
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return input
+	}
+
+	promptsDir := filepath.Join(home, ".llmterm", "prompts")
+
+	// 1. Check .md
+	mdPath := filepath.Join(promptsDir, input+".md")
+	if content, err := os.ReadFile(mdPath); err == nil {
+		return string(content)
+	}
+
+	// 2. Check .txt
+	txtPath := filepath.Join(promptsDir, input+".txt")
+	if content, err := os.ReadFile(txtPath); err == nil {
+		return string(content)
+	}
+
+	return input
+}
+
+func prepareLLMParams(cmd *cobra.Command, runCfg RunConfig) (
+	string,
+	string,
+	string,
+	int,
+	*float64,
+	map[string]interface{},
+	error,
+) {
+	modelname := runCfg.ModelName
+	apiKey := runCfg.ApiKey
+	apiBase := runCfg.ApiBase
+	temperature := runCfg.Temperature
+	seed := runCfg.Seed
+	maxTokens := runCfg.MaxTokens
+	configExtraBody := runCfg.ExtraBody
+
+	// Apply reasoning settings
+	reasoningMax := runCfg.ReasoningMaxTokens
+	reasoningExclude := runCfg.ReasoningExclude
+
+	stopSequences, _ := cmd.Flags().GetString("stop")
+	var stopSeqInterface interface{}
+	if strings.HasPrefix(stopSequences, "[") && strings.HasSuffix(stopSequences, "]") {
+		var stopSeqArray []string
+		err := json.Unmarshal([]byte(stopSequences), &stopSeqArray)
+		if err != nil {
+			return "", "", "", 0, nil, nil, err
+		}
+		stopSeqInterface = stopSeqArray
+	} else {
+		stopSeqInterface = stopSequences
+	}
+
+	extraParams, _ := cmd.Flags().GetString("extra")
+	extraParamsMap := map[string]interface{}{}
+	if err := json.Unmarshal([]byte(extraParams), &extraParamsMap); err != nil {
+		return "", "", "", 0, nil, nil, fmt.Errorf("failed to parse extra params JSON: %w", err)
+	}
+
+	extra := map[string]interface{}{}
+	if maxTokens > 0 {
+		extra["max_tokens"] = maxTokens
+	}
+
+	// Use flat reasoning_effort for Chat Completions (OpenAI/New Standard)
+	if runCfg.ReasoningEffort != "" && runCfg.ReasoningEffort != "none" {
+		extra["reasoning_effort"] = runCfg.ReasoningEffort
+	}
+
+	reasoningObj := make(map[string]interface{})
+	if reasoningMax > 0 {
+		reasoningObj["max_tokens"] = reasoningMax
+	}
+	if reasoningExclude {
+		reasoningObj["exclude"] = true
+	}
+
+	if len(reasoningObj) > 0 {
+		extra["reasoning"] = reasoningObj
+	}
+
+	// Add verbosity if set
+	if runCfg.Verbosity != "" {
+		extra["verbosity"] = runCfg.Verbosity
+	}
+
+	switch v := stopSeqInterface.(type) {
+	case string:
+		if v != "" {
+			extra["stop"] = v
+		}
+	case []string:
+		if len(v) > 0 {
+			extra["stop"] = v
+		}
+	default:
+	}
+
+	jsonSchema, _ := cmd.Flags().GetString("json-schema")
+	jsonMode, _ := cmd.Flags().GetBool("json")
+
+	if len(jsonSchema) > 0 {
+		jsonSchemaObj := map[string]interface{}{}
+		if err := json.Unmarshal([]byte(jsonSchema), &jsonSchemaObj); err != nil {
+			return "", "", "", 0, nil, nil, err
+		}
+		extra["json_schema"] = jsonSchemaObj
+	} else if jsonMode {
+		extra["response_format"] = map[string]interface{}{"type": "json_object"}
+	}
+
+	for k, v := range configExtraBody {
+		extra[k] = v
+	}
+
+	// CLI params override config
+	for k, v := range extraParamsMap {
+		extra[k] = v
+	}
+
+	return modelname, apiKey, apiBase, seed, temperature, extra, nil
+}
+
+func makeLLMApiFunc(
+	parentCtx context.Context,
+	cfg *ConfigFile,
+	cmd *cobra.Command,
+	initialRunCfg RunConfig,
+	stream bool,
+	verbose bool,
+) func(messages []Message) (<-chan StreamEvent, error) {
+	return func(messages []Message) (<-chan StreamEvent, error) {
+		filteredMessages := make([]LLMMessage, len(messages))
+		for i, msg := range messages {
+			if len(msg.Images) > 0 {
+				parts := []ContentPart{
+					{Type: "text", Text: msg.Content},
+				}
+				for _, img := range msg.Images {
+					parts = append(parts, ContentPart{
+						Type: "image_url",
+						ImageUrl: &ImageUrl{Url: img},
+					})
+				}
+				filteredMessages[i] = LLMMessage{
+					Role:    msg.Role,
+					Content: parts,
+				}
+			} else {
+				filteredMessages[i] = LLMMessage{
+					Role:    msg.Role,
+					Content: msg.Content,
+				}
+			}
+		}
+
+		models := []string{initialRunCfg.ModelName}
+		models = append(models, initialRunCfg.Fallback...)
+
+		var lastErr error
+
+		for i, modelName := range models {
+			var currentRunCfg RunConfig
+			if i == 0 {
+				currentRunCfg = initialRunCfg
+			} else {
+				var err error
+				currentRunCfg, err = getRunConfig(cmd, cfg, modelName)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: failed to resolve fallback config for %s: %v\n", modelName, err)
+					lastErr = err
+					continue
+				}
+			}
+
+			modelname, apiKey, apiBase, seed, temperature, extra, err := prepareLLMParams(cmd, currentRunCfg)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+
+			// Create a new context for this specific request attempt
+			reqCtx, cancel := context.WithTimeout(parentCtx, currentRunCfg.Timeout)
+
+			// Create a channel wrapper to handle deferred cancellation
+			outCh := make(chan StreamEvent)
+
+			inCh, err := llmChat(reqCtx, filteredMessages, modelname, seed, temperature, nil, apiKey, apiBase, stream, extra, verbose)
+			if err != nil {
+				cancel()
+				lastErr = err
+				if i < len(models)-1 {
+					fmt.Fprintf(os.Stderr, "Warning: Model %s failed: %v. Switching to fallback...\n", modelName, err)
+					continue
+				}
+				return nil, err
+			}
+
+			go func() {
+				defer cancel()
+				defer close(outCh)
+
+				for {
+					select {
+					case <-reqCtx.Done():
+						return
+					case evt, ok := <-inCh:
+						if !ok {
+							return
+						}
+						outCh <- evt
+					}
+				}
+			}()
+
+			return outCh, nil
+		}
+
+		return nil, lastErr
+	}
+}
+
 func runLLMChat(cmd *cobra.Command, args []string) error {
 	// Check for --session flag alias
 	isSession, _ := cmd.Flags().GetBool("session")
@@ -1115,7 +1357,8 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	verbose, _ := cmd.Flags().GetBool("verbose")
 	chat, _ := cmd.Flags().GetBool("chat")
 	chat_send, _ := cmd.Flags().GetBool("chat-send")
-	systemPrompt, _ := cmd.Flags().GetString("prompt")
+	systemPromptArg, _ := cmd.Flags().GetString("prompt")
+	systemPrompt := resolvePrompt(systemPromptArg)
 	debug, _ := cmd.Flags().GetBool("debug")
 	maxTokens, _ := cmd.Flags().GetInt("max_tokens")
 	jsonMode, _ := cmd.Flags().GetBool("json")
@@ -1128,8 +1371,8 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	reasoningMedium, _ := cmd.Flags().GetBool("reasoning-medium")
 	reasoningHigh, _ := cmd.Flags().GetBool("reasoning-high")
 	reasoningXHigh, _ := cmd.Flags().GetBool("reasoning-xhigh")
-	reasoningMax, _ := cmd.Flags().GetInt("reasoning-max")
-	reasoningExclude, _ := cmd.Flags().GetBool("reasoning-exclude")
+	_, _ = cmd.Flags().GetInt("reasoning-max")
+	_, _ = cmd.Flags().GetBool("reasoning-exclude")
 
 	// Clipboard flags
 	useClipboard, _ := cmd.Flags().GetBool("clipboard")
@@ -1189,8 +1432,6 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	var configExtraBody map[string]interface{}
-
 	// Apply config profile overrides if modelname matches a profile and flag not explicitly set
 	// Resolve configuration
 	runCfg, err := getRunConfig(cmd, cfg, modelname)
@@ -1198,53 +1439,31 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 		log.Printf("Warning: failed to resolve config: %v", err)
 	}
 
-	// Apply resolved config
-	modelname = runCfg.ModelName
-	apiKey = runCfg.ApiKey
-	apiBase = runCfg.ApiBase
-	temperature := runCfg.Temperature
-	seed = runCfg.Seed
+	// Prepare params using helper
+	pModel, pKey, pBase, pSeed, pTemp, pExtra, err := prepareLLMParams(cmd, runCfg)
+	if err != nil {
+		return err
+	}
+
+	modelname = pModel
+	apiKey = pKey
+	apiBase = pBase
+	seed = pSeed
+	temperature := pTemp
 	maxTokens = runCfg.MaxTokens
 	contextOrder = runCfg.ContextOrder
-	configExtraBody = runCfg.ExtraBody
-
-	// Apply reasoning settings
-	reasoningMax = runCfg.ReasoningMaxTokens
-	reasoningExclude = runCfg.ReasoningExclude
-
-	// Reset reasoning flags based on resolved config
-	noReasoning = false
-	reasoningLow = false
-	reasoningMedium = false
-	reasoningHigh = false
-	reasoningXHigh = false
-
-	switch runCfg.ReasoningEffort {
-	case "none":
-		noReasoning = true
-	case "low":
-		reasoningLow = true
-	case "medium":
-		reasoningMedium = true
-	case "high":
-		reasoningHigh = true
-	case "xhigh":
-		reasoningXHigh = true
-	}
 
 	// Apply top-level piped_input_wrapper from config if flag not explicitly set
 	if cfg.PipedInputWrapper != nil && !cmd.Flags().Changed("piped-wrapper") {
 		pipedWrapper = *cfg.PipedInputWrapper
 	}
 
+	// Re-parse stop sequences for logging
 	stopSequences, _ := cmd.Flags().GetString("stop")
 	var stopSeqInterface interface{}
 	if strings.HasPrefix(stopSequences, "[") && strings.HasSuffix(stopSequences, "]") {
 		var stopSeqArray []string
-		err := json.Unmarshal([]byte(stopSequences), &stopSeqArray)
-		if err != nil {
-			log.Fatal(err)
-		}
+		json.Unmarshal([]byte(stopSequences), &stopSeqArray)
 		stopSeqInterface = stopSeqArray
 	} else {
 		stopSeqInterface = stopSequences
@@ -1269,7 +1488,7 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	cwd, _ := os.Getwd()
 
 	// Construct initial user message to parse for @ tokens
-	var usermsg string = strings.Join(args, " ")
+	var usermsg string = resolvePrompt(strings.Join(args, " "))
 
 	resolver := NewPathResolver(verbose)
 	cleanedPrompt, atPaths := resolver.ParsePrompt(usermsg)
@@ -1548,8 +1767,6 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	}
 
 	// Determine reasoning configuration with mutual exclusivity handling
-	var reasoningConfiguredMax int
-	var reasoningConfiguredExclude bool
 	reasoningFlagCount := 0
 
 	if noReasoning {
@@ -1567,16 +1784,11 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	if reasoningXHigh {
 		reasoningFlagCount++
 	}
-	if reasoningMax > 0 {
-		reasoningConfiguredMax = reasoningMax
-	}
 
 	// Warn if multiple reasoning flags were specified
 	if reasoningFlagCount > 1 {
 		fmt.Fprintf(os.Stderr, "Warning: Multiple reasoning effort flags specified, using last-specified option\n")
 	}
-
-	reasoningConfiguredExclude = reasoningExclude
 
 	if debug || dryRun {
 		sTokens := estimateTokens(systemPrompt)
@@ -1604,7 +1816,7 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 
 	// Only mark start if new session
 	if resumedSessionUUID == "" && !dryRun {
-		markChatStart(session, usermsg, systemPrompt, modelname, seed, temperature, apiBase, maxTokens, jsonMode, stopSeqInterface, extraParams, jsonSchema, runCfg.ReasoningEffort, reasoningConfiguredMax, reasoningConfiguredExclude)
+		markChatStart(session, usermsg, systemPrompt, modelname, seed, temperature, apiBase, maxTokens, jsonMode, stopSeqInterface, extraParams, jsonSchema, runCfg.ReasoningEffort, runCfg.ReasoningMaxTokens, runCfg.ReasoningExclude)
 	} else if resumedSessionUUID != "" && !dryRun && len(usermsg) > 0 {
 		// If resuming, explicitly save the user message to history
 		// We can get the UUID from the last message added to 'messages'
@@ -1625,76 +1837,7 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	var extra map[string]interface{}
-
-	extraParamsMap := map[string]interface{}{}
-	if err := json.Unmarshal([]byte(extraParams), &extraParamsMap); err != nil {
-		return fmt.Errorf("failed to parse extra params JSON: %w", err)
-	}
-
-	extra = map[string]interface{}{}
-	if maxTokens > 0 {
-		extra["max_tokens"] = maxTokens
-	}
-
-	// Use flat reasoning_effort for Chat Completions (OpenAI/New Standard)
-	// We use the runCfg value which is the source of truth after flag/config resolution
-	if runCfg.ReasoningEffort != "" && runCfg.ReasoningEffort != "none" {
-		extra["reasoning_effort"] = runCfg.ReasoningEffort
-	}
-
-	// Handle legacy/OpenRouter specific fields via reasoning object
-	// We construct this separately because some providers (OpenRouter) might want
-	// both reasoning_effort (flat) AND extra parameters in a reasoning object,
-	// or reasoning_effort might be ignored if reasoning object is present depending on the provider.
-	// But based on user requirements to support exclude, we must send it.
-	reasoningObj := make(map[string]interface{})
-	if reasoningConfiguredMax > 0 {
-		reasoningObj["max_tokens"] = reasoningConfiguredMax
-	}
-	if reasoningConfiguredExclude {
-		reasoningObj["exclude"] = true
-	}
-
-	if len(reasoningObj) > 0 {
-		extra["reasoning"] = reasoningObj
-	}
-
-	// Add verbosity if set
-	if runCfg.Verbosity != "" {
-		extra["verbosity"] = runCfg.Verbosity
-	}
-
-	switch v := stopSeqInterface.(type) {
-	case string:
-		if v != "" {
-			extra["stop"] = v
-		}
-	case []string:
-		if len(v) > 0 {
-			extra["stop"] = v
-		}
-	default:
-	}
-
-	if len(jsonSchema) > 0 {
-		jsonSchemaObj := map[string]interface{}{}
-		if err := json.Unmarshal([]byte(jsonSchema), &jsonSchemaObj); err != nil {
-			log.Fatal(err)
-		}
-		extra["json_schema"] = jsonSchemaObj
-	} else if jsonMode {
-		extra["response_format"] = map[string]interface{}{"type": "json_object"}
-	}
-
-	for k, v := range configExtraBody {
-		extra[k] = v
-	}
-
-	// CLI params override config
-	for k, v := range extraParamsMap {
-		extra[k] = v
-	}
+	extra := pExtra
 
 	if dryRun {
 		// Construct full payload for display
@@ -1745,36 +1888,12 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Create context for LLM cancellation with configured timeout
-	ctx, cancel := context.WithTimeout(context.Background(), runCfg.Timeout)
-	defer cancel()
-
-	llmApiFunc := func(messages []Message) (<-chan StreamEvent, error) {
-		filteredMessages := make([]LLMMessage, len(messages))
-		for i, msg := range messages {
-			if len(msg.Images) > 0 {
-				parts := []ContentPart{
-					{Type: "text", Text: msg.Content},
-				}
-				for _, img := range msg.Images {
-					parts = append(parts, ContentPart{
-						Type: "image_url",
-						ImageUrl: &ImageUrl{Url: img},
-					})
-				}
-				filteredMessages[i] = LLMMessage{
-					Role:    msg.Role,
-					Content: parts,
-				}
-			} else {
-				filteredMessages[i] = LLMMessage{
-					Role:    msg.Role,
-					Content: msg.Content,
-				}
-			}
-		}
-		return llmChat(ctx, filteredMessages, modelname, seed, temperature, nil, apiKey, apiBase, stream, extra, verbose)
+	parentCtx := cmd.Context()
+	if parentCtx == nil {
+		parentCtx = context.Background()
 	}
+
+	llmApiFunc := makeLLMApiFunc(parentCtx, cfg, cmd, runCfg, stream, verbose)
 
 	llmHistoryFunc := func(msg Message) error {
 		if historyMgr == nil {

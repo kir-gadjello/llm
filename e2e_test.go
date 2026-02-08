@@ -50,6 +50,13 @@ func MockEchoHandler() http.HandlerFunc {
 		var reqMap map[string]interface{}
 		json.Unmarshal(bodyBytes, &reqMap)
 
+		// Special Logic: Fault Injection
+		if model, ok := reqMap["model"].(string); ok && model == "mock-fail" {
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte("mock failure"))
+			return
+		}
+
 		// Special Logic: Shell Assistant
 		// If the system prompt indicates shell assistant, return a valid code block
 		// so the CLI logic (which parses markdown) succeeds.
@@ -147,6 +154,11 @@ func TestCLI(t *testing.T) {
 	exec.Command("git", "-C", tempCwd, "config", "user.email", "test@example.com").Run()
 	exec.Command("git", "-C", tempCwd, "config", "user.name", "Test").Run()
 	exec.Command("git", "-C", tempCwd, "add", ".").Run()
+
+	// Initialize Prompts
+	promptsDir := filepath.Join(tempHome, ".llmterm", "prompts")
+	os.MkdirAll(promptsDir, 0755)
+	os.WriteFile(filepath.Join(promptsDir, "test_sys_prompt.md"), []byte("ACT AS PIRATE"), 0644)
 
 	baseConfig := fmt.Sprintf("models:\n  default:\n    api_base: %s\n", server.URL)
 
@@ -422,6 +434,24 @@ models:
 			Name: "Save To Dir",
 			Args: []string{"save_test_dir", "--save-to", "."},
 			Want: "Saved output to",
+		},
+		{
+			Name: "Fallback Success",
+			Conf: `
+models:
+  mock-fail:
+    api_base: ` + server.URL + `
+    fallback: [mock-success]
+  mock-success:
+    api_base: ` + server.URL + `
+`,
+			Args: []string{"-m", "mock-fail", "hi"},
+			Want: `"model":"mock-success"`,
+		},
+		{
+			Name: "Prompt Loading",
+			Args: []string{"-p", "test_sys_prompt", "hi"},
+			Want: `"content":"ACT AS PIRATE"`,
 		},
 	}
 

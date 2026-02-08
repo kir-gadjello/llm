@@ -201,8 +201,16 @@ type ConfigFile struct {
 	ThinkingStartTag    *string                `yaml:"thinking_start_tag,omitempty"`
 	ThinkingEndTag      *string                `yaml:"thinking_end_tag,omitempty"`
 	Models              map[string]ModelConfig `yaml:"models,omitempty"`
-	Shell               *ShellConfig           `yaml:"shell,omitempty"`
-	Context             *ContextConfig         `yaml:"context,omitempty"`
+	Shell               *ShellConfig            `yaml:"shell,omitempty"`
+	Context             *ContextConfig          `yaml:"context,omitempty"`
+	FallbackModels      []string                `yaml:"fallback_models,omitempty"`
+	FallbackSettings    *FallbackSettings       `yaml:"fallback_settings,omitempty"`
+}
+
+type FallbackSettings struct {
+	Allow   []string `yaml:"allow,omitempty"`
+	Deny    []string `yaml:"deny,omitempty"`
+	Default string   `yaml:"default,omitempty"` // "allow" or "deny"
 }
 
 func loadConfig() (*ConfigFile, error) {
@@ -733,7 +741,7 @@ func main() {
 
 	// API/Debug
 	rootCmd.Flags().StringP("api-key", "k", "", "OpenAI API key")
-	rootCmd.Flags().StringP("api-base", "b", "https://api.openai.com/v1/", "OpenAI API base URL")
+	rootCmd.Flags().StringP("api-base", "b", "", "OpenAI API base URL (default \"https://api.openai.com/v1/\")")
 	rootCmd.Flags().StringP("extra", "e", "{}", "Additional LLM API parameters expressed as json, take precedence over provided CLI arguments")
 	rootCmd.Flags().BoolP("json", "j", false, "json mode")
 	rootCmd.Flags().StringP("json-schema", "J", "", "json schema (compatible with llama.cpp and tabbyAPI, not compatible with OpenAI)")
@@ -1251,7 +1259,11 @@ func makeLLMApiFunc(
 		}
 
 		models := []string{initialRunCfg.ModelName}
-		models = append(models, initialRunCfg.Fallback...)
+		if len(initialRunCfg.Fallback) > 0 {
+			models = append(models, initialRunCfg.Fallback...)
+		} else if len(cfg.FallbackModels) > 0 {
+			models = append(models, cfg.FallbackModels...)
+		}
 
 		var errs []error
 
@@ -1286,9 +1298,8 @@ func makeLLMApiFunc(
 				cancel()
 				errs = append(errs, fmt.Errorf("api error %s: %w", modelName, err))
 
-				// Spec Compliance: Fail Immediately on 400/401
-				// Error message format from llm_api.go: "API error (status %d): %s"
-				if strings.Contains(err.Error(), "status 400") || strings.Contains(err.Error(), "status 401") {
+				// Check fallback eligibility based on config
+				if !checkFallbackEligibility(err, cfg.FallbackSettings) {
 					return nil, err
 				}
 
@@ -2701,4 +2712,85 @@ type updateViewportMsg struct {
 	streaming   bool
 	content     string
 	isReasoning bool
+}
+
+func isPattern(s string) bool {
+	return strings.ContainsAny(s, "*?[]\\")
+}
+
+func checkFallbackEligibility(err error, settings *FallbackSettings) bool {
+	msg := err.Error()
+	var statusCode int
+	// Attempt to parse "status 400" or "status 500" from error string
+	// Format from llm_api.go: "API error (status %d): %s"
+	hasStatus := false
+	if n, _ := fmt.Sscanf(msg, "API error (status %d):", &statusCode); n == 0 {
+		// Fallback regex scan if prefix changes, or handle simple substring checks for common codes
+		// Simple parsing for standard Go error strings
+		re := regexp.MustCompile(`status (\d+)`)
+		matches := re.FindStringSubmatch(msg)
+		if len(matches) > 1 {
+			fmt.Sscanf(matches[1], "%d", &statusCode)
+			hasStatus = true
+		}
+	} else {
+		hasStatus = true
+	}
+
+	// Default settings if not provided
+	if settings == nil {
+		settings = &FallbackSettings{
+			Default: "deny",
+			// Default allow: 429 (Too Many Requests), 427 (Request Header Fields Too Large/Prompt Limit),
+			// 408 (Timeout), 5xx (Server Errors)
+			Allow: []string{"429", "427", "408", "5*"},
+			// Default deny: Client errors
+			Deny: []string{"4*"},
+		}
+	}
+
+	statusStr := fmt.Sprintf("%d", statusCode)
+
+	// If it's a network error (no status code), we generally allow retry unless strict deny
+	if !hasStatus {
+		// Treat network errors as "transport" errors, usually eligible for retry
+		// unless default is explicitly deny.
+		return settings.Default != "deny"
+	}
+
+	// Specificity-aware check:
+	// 1. Exact Deny (Blacklist)
+	for _, pattern := range settings.Deny {
+		if !isPattern(pattern) && pattern == statusStr {
+			return false
+		}
+	}
+
+	// 2. Exact Allow (Whitelist)
+	for _, pattern := range settings.Allow {
+		if !isPattern(pattern) && pattern == statusStr {
+			return true
+		}
+	}
+
+	// 3. Pattern Deny (Blacklist)
+	for _, pattern := range settings.Deny {
+		if isPattern(pattern) {
+			if matched, _ := filepath.Match(pattern, statusStr); matched {
+				return false
+			}
+		}
+	}
+
+	// 4. Pattern Allow (Whitelist)
+	for _, pattern := range settings.Allow {
+		if isPattern(pattern) {
+			if matched, _ := filepath.Match(pattern, statusStr); matched {
+				return true
+			}
+		}
+	}
+
+	// 5. Fallback to Default
+	return settings.Default == "allow"
 }

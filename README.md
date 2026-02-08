@@ -298,6 +298,34 @@ context:
   debug_truncate_files: 10                    # Truncate file context in debug output
 ```
 
+### Fallback Configuration
+
+You can configure global fallback models and precise error handling policies for resiliency.
+
+**Global Fallback Models:**
+If a specific model configuration does not define its own `fallback` list, these models will be tried in order.
+
+```yaml
+fallback_models:
+  - grok
+  - gpt-4o-mini
+
+```
+
+**Fallback Settings:**
+Control which error codes trigger a fallback attempt and which ones abort immediately.
+
+```yaml
+fallback_settings:
+  default: deny
+  allow:
+    - "427" # Token limit / Header too large
+    - "429" # Rate limit
+    - "5*"  # Server errors
+  deny:
+    - "400" # Bad Request
+    - "401" # Unauthorized
+```
 
 Use with `-m <profile>`. CLI flags override config values.
 

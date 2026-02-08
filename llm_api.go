@@ -46,18 +46,20 @@ type ImageUrl struct {
 }
 
 func resolveLLMApi(apiKey string, apiBase string) (string, string, error) {
-	// If apiKey is already set (from config), use it
+	// If apiKey is already set (from config or flag), use it
 	if apiKey == "" {
 		apiKey = os.Getenv("OPENAI_API_KEY")
 	}
 
-	url := os.Getenv("OPENAI_API_BASE")
-	if url == "" {
-		url = apiBase
+	if apiBase == "" {
+		apiBase = os.Getenv("OPENAI_API_BASE")
 	}
-	url = strings.TrimSuffix(url, "/")
+	if apiBase == "" {
+		apiBase = "https://api.openai.com/v1/"
+	}
+	apiBase = strings.TrimSuffix(apiBase, "/")
 
-	return apiKey, url, nil
+	return apiKey, apiBase, nil
 }
 
 func urlJoin(base, rel string) (string, error) {

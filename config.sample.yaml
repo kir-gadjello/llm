@@ -81,3 +81,25 @@ context:
     - __pycache__
     - .next
     - build
+
+# Fallback Configuration
+# Global fallback models used if a specific model doesn't define its own fallback list
+fallback_models:
+  - grok
+  - gpt-4o-mini
+
+# Fine-grained control over what errors trigger a fallback
+fallback_settings:
+  default: deny
+  # Whitelist of error codes that trigger fallback (Globs supported)
+  allow:
+    - "427" # Important: Token limit/Header constraints
+    - "429" # Rate limits
+    - "5*"  # Server errors (500, 502, 503, etc)
+    - "408" # Request Timeout
+  # Blacklist of error codes that immediately abort (fail-fast)
+  deny:
+    - "400" # Bad Request
+    - "401" # Unauthorized
+    - "403" # Forbidden
+    - "404" # Not Found

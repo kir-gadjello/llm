@@ -15,6 +15,16 @@ import (
 
 // TestContextFreshness verifies that subsequent requests get a new context timeout.
 func TestContextFreshness(t *testing.T) {
+	// 0. Isolate from environment
+	oldAPIBase := os.Getenv("OPENAI_API_BASE")
+	oldAPIKey := os.Getenv("OPENAI_API_KEY")
+	os.Unsetenv("OPENAI_API_BASE")
+	os.Unsetenv("OPENAI_API_KEY")
+	defer func() {
+		os.Setenv("OPENAI_API_BASE", oldAPIBase)
+		os.Setenv("OPENAI_API_KEY", oldAPIKey)
+	}()
+
 	// 1. Setup Mock Server with delay
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(50 * time.Millisecond) // Delay less than timeout

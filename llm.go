@@ -1085,6 +1085,12 @@ func resolvePrompt(input string) string {
 		return ""
 	}
 
+	// Security: Prevent path traversal
+	// Only allow strict filenames, no directories
+	if filepath.Base(input) != input {
+		return input
+	}
+
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return input
@@ -1247,7 +1253,7 @@ func makeLLMApiFunc(
 		models := []string{initialRunCfg.ModelName}
 		models = append(models, initialRunCfg.Fallback...)
 
-		var lastErr error
+		var errs []error
 
 		for i, modelName := range models {
 			var currentRunCfg RunConfig
@@ -1258,14 +1264,14 @@ func makeLLMApiFunc(
 				currentRunCfg, err = getRunConfig(cmd, cfg, modelName)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Warning: failed to resolve fallback config for %s: %v\n", modelName, err)
-					lastErr = err
+					errs = append(errs, fmt.Errorf("config error %s: %w", modelName, err))
 					continue
 				}
 			}
 
 			modelname, apiKey, apiBase, seed, temperature, extra, err := prepareLLMParams(cmd, currentRunCfg)
 			if err != nil {
-				lastErr = err
+				errs = append(errs, fmt.Errorf("params error %s: %w", modelName, err))
 				continue
 			}
 
@@ -1278,17 +1284,31 @@ func makeLLMApiFunc(
 			inCh, err := llmChat(reqCtx, filteredMessages, modelname, seed, temperature, nil, apiKey, apiBase, stream, extra, verbose)
 			if err != nil {
 				cancel()
-				lastErr = err
+				errs = append(errs, fmt.Errorf("api error %s: %w", modelName, err))
+
+				// Spec Compliance: Fail Immediately on 400/401
+				// Error message format from llm_api.go: "API error (status %d): %s"
+				if strings.Contains(err.Error(), "status 400") || strings.Contains(err.Error(), "status 401") {
+					return nil, err
+				}
+
 				if i < len(models)-1 {
 					fmt.Fprintf(os.Stderr, "Warning: Model %s failed: %v. Switching to fallback...\n", modelName, err)
 					continue
 				}
-				return nil, err
+				// All failed (if this is last)
+				break
 			}
 
 			go func() {
 				defer cancel()
 				defer close(outCh)
+
+				// Emit Meta Event for Model Reporting
+				outCh <- StreamEvent{
+					Type:  "meta",
+					Model: modelName,
+				}
 
 				for {
 					select {
@@ -1306,7 +1326,16 @@ func makeLLMApiFunc(
 			return outCh, nil
 		}
 
-		return nil, lastErr
+		if len(errs) > 0 {
+			// Aggregated error
+			errMsg := "all models failed:\n"
+			for _, e := range errs {
+				errMsg += fmt.Sprintf("- %v\n", e)
+			}
+			return nil, errors.New(errMsg)
+		}
+
+		return nil, fmt.Errorf("no models configured")
 	}
 }
 
@@ -1992,6 +2021,20 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	var tokens_gen int
 
 	for event := range ch {
+		if event.Type == "meta" {
+			// Update local model name for correct reporting
+			if event.Model != "" && event.Model != modelname {
+				if verbose {
+					fmt.Fprintf(os.Stderr, "Switching session model from %s to %s\n", modelname, event.Model)
+				}
+				modelname = event.Model
+				if historyMgr != nil {
+					historyMgr.UpdateSessionModel(session.UUID, modelname)
+				}
+			}
+			continue
+		}
+
 		if firstChunk {
 			if debug {
 				timings.TimeToFirstChunk = time.Since(startTime)
@@ -2627,6 +2670,19 @@ func (m chatTuiState) View() string {
 func readLLMResponse(m chatTuiState, ch <-chan StreamEvent) tea.Cmd {
 	return func() tea.Msg {
 		for event := range ch {
+			if event.Type == "meta" {
+				if event.Model != "" {
+					// We might want to update the TUI model name here, but the state update loop
+					// doesn't easily support side-effects on external historyMgr without passing it through msg.
+					// For now, we update history directly if available (since this runs in a goroutine/cmd).
+					// NOTE: This relies on global historyMgr, which is available in main package.
+					if historyMgr != nil {
+						// We need the session UUID. It's in m.session.UUID.
+						historyMgr.UpdateSessionModel(m.session.UUID, event.Model)
+					}
+				}
+				continue
+			}
 			if event.Type == "content" {
 				return updateViewportMsg{content: event.Content, streaming: true, isReasoning: false}
 			} else if event.Type == "reasoning" {

@@ -171,6 +171,12 @@ func (m *Manager) SaveShellEvent(data ShellEvent) error {
 	return m.appendJSONL(data)
 }
 
+// UpdateSessionModel updates the model name for an existing session in the database
+func (m *Manager) UpdateSessionModel(uuid, model string) error {
+	_, err := m.db.Exec("UPDATE sessions SET model = ? WHERE uuid = ?", model, uuid)
+	return err
+}
+
 func (m *Manager) appendJSONL(data interface{}) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

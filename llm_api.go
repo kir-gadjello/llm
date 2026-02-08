@@ -16,8 +16,9 @@ import (
 )
 
 type StreamEvent struct {
-	Type    string // "content" or "reasoning"
+	Type    string // "content" or "reasoning" or "meta"
 	Content string
+	Model   string // Used for "meta" events to report the actual model used
 }
 
 type LLMChatRequestBasic struct {

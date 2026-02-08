@@ -57,6 +57,8 @@ func MockEchoHandler() http.HandlerFunc {
 			return
 		}
 
+		responseContent := string(bodyBytes)
+
 		// Special Logic: Shell Assistant
 		// If the system prompt indicates shell assistant, return a valid code block
 		// so the CLI logic (which parses markdown) succeeds.
@@ -66,53 +68,51 @@ func MockEchoHandler() http.HandlerFunc {
 				if msg["role"] == "system" {
 					content := msg["content"].(string)
 					if strings.Contains(content, "generate a shell command") {
-						response := map[string]interface{}{
-							"choices": []interface{}{
-								map[string]interface{}{
-									"message": map[string]interface{}{
-										"role":    "assistant",
-										"content": "```bash\necho YOLO_SUCCESS\n```",
-									},
-								},
-							},
-						}
-						json.NewEncoder(w).Encode(response)
-						return
+						responseContent = "```bash\necho YOLO_SUCCESS\n```"
+						break
 					}
 					// Special Logic: Auto Selector
 					if strings.Contains(content, "smart file selector") {
-						response := map[string]interface{}{
-							"choices": []interface{}{
-								map[string]interface{}{
-									"message": map[string]interface{}{
-										"role":    "assistant",
-										"content": "subdir/test.txt",
-									},
-								},
-							},
-						}
-						json.NewEncoder(w).Encode(response)
-						return
+						responseContent = "subdir/test.txt"
+						break
 					}
 				}
 			}
 		}
 
-		// Default Logic: Return the Request JSON as the Response Content
-		// This lets the test read stdout to see what was sent to the server.
-		responseContent := string(bodyBytes)
+		stream, _ := reqMap["stream"].(bool)
 
-		resp := map[string]interface{}{
-			"choices": []interface{}{
-				map[string]interface{}{
-					"message": map[string]interface{}{
-						"role":    "assistant",
-						"content": responseContent,
+		if stream {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+
+			// SSE format: data: {"choices": [{"delta": {"content": "..."}}]}
+			resp := map[string]interface{}{
+				"choices": []interface{}{
+					map[string]interface{}{
+						"delta": map[string]interface{}{
+							"content": responseContent,
+						},
 					},
 				},
-			},
+			}
+			respBytes, _ := json.Marshal(resp)
+			fmt.Fprintf(w, "data: %s\n\n", string(respBytes))
+			fmt.Fprintf(w, "data: [DONE]\n\n")
+		} else {
+			w.Header().Set("Content-Type", "application/json")
+			resp := map[string]interface{}{
+				"choices": []interface{}{
+					map[string]interface{}{
+						"message": map[string]interface{}{
+							"role":    "assistant",
+							"content": responseContent,
+						},
+					},
+				},
+			}
+			json.NewEncoder(w).Encode(resp)
 		}
-		json.NewEncoder(w).Encode(resp)
 	}
 }
 
@@ -178,8 +178,23 @@ func TestCLI(t *testing.T) {
 		},
 		{
 			Name: "System Prompt",
-			Args: []string{"-p", "act like a pirate", "hi"},
-			Want: `"content":"act like a pirate"`,
+			Args: []string{"-S", "act like a pirate", "hi"},
+			Want: `"content":"act like a pirate","role":"system"`,
+		},
+		{
+			Name: "User Prompt Prefix",
+			Args: []string{"-p", "Think step by step:", "how to make tea?"},
+			Want: `"content":"Think step by step:\nhow to make tea?","role":"user"`,
+		},
+		{
+			Name: "System & User Prompt Combined",
+			Args: []string{"-S", "You are a chef", "-p", "Recipe for:", "pizza"},
+			Want: `"content":"You are a chef","role":"system"`,
+		},
+		{
+			Name: "System & User Prompt Combined (User Part)",
+			Args: []string{"-S", "You are a chef", "-p", "Recipe for:", "pizza"},
+			Want: `"content":"Recipe for:\npizza","role":"user"`,
 		},
 		{
 			Name: "Max Tokens",
@@ -449,9 +464,14 @@ models:
 			Want: `"model":"mock-success"`,
 		},
 		{
-			Name: "Prompt Loading",
+			Name: "System Prompt Loading",
+			Args: []string{"-S", "test_sys_prompt", "hi"},
+			Want: `"content":"ACT AS PIRATE","role":"system"`,
+		},
+		{
+			Name: "User Prompt Loading",
 			Args: []string{"-p", "test_sys_prompt", "hi"},
-			Want: `"content":"ACT AS PIRATE"`,
+			Want: `"content":"ACT AS PIRATE\nhi","role":"user"`,
 		},
 	}
 

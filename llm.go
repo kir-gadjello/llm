@@ -692,15 +692,15 @@ func main() {
 		TraverseChildren: true,
 	}
 
-	var is_terminal bool = is_interactive(os.Stdout.Fd())
-
 	rootCmd.Flags().StringP("model", "m", "", "LLM model: OPENAI_API_MODEL,GROQ_API_MODEL,LLM_MODEL from env or gpt-3.5-turbo")
-	rootCmd.Flags().StringP("prompt", "p", "", "System prompt")
+	rootCmd.Flags().StringP("system", "S", "", "System prompt")
+	rootCmd.Flags().StringP("prompt", "p", "", "User prompt prefix")
 	rootCmd.Flags().Float64P("temperature", "t", 0.0, "Temperature")
 	rootCmd.Flags().Int("timeout", 4200, "API timeout in seconds (default 70 mins)")
 	rootCmd.Flags().IntP("seed", "r", 1337, "Random seed")
 	rootCmd.Flags().IntP("max_tokens", "N", 0, "Max amount of tokens in response (0 = model default)")
-	rootCmd.Flags().BoolP("stream", "S", is_terminal, "Stream output")
+	rootCmd.Flags().Bool("stream", true, "Stream output")
+	rootCmd.Flags().Lookup("stream").NoOptDefVal = "true"
 
 	// Reasoning controls
 	rootCmd.Flags().String("reasoning", "", "Reasoning effort (low, medium, high, etc.)")
@@ -1109,13 +1109,13 @@ func resolvePrompt(input string) string {
 	// 1. Check .md
 	mdPath := filepath.Join(promptsDir, input+".md")
 	if content, err := os.ReadFile(mdPath); err == nil {
-		return string(content)
+		return strings.TrimSpace(string(content))
 	}
 
 	// 2. Check .txt
 	txtPath := filepath.Join(promptsDir, input+".txt")
 	if content, err := os.ReadFile(txtPath); err == nil {
-		return string(content)
+		return strings.TrimSpace(string(content))
 	}
 
 	return input
@@ -1397,8 +1397,10 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	verbose, _ := cmd.Flags().GetBool("verbose")
 	chat, _ := cmd.Flags().GetBool("chat")
 	chat_send, _ := cmd.Flags().GetBool("chat-send")
-	systemPromptArg, _ := cmd.Flags().GetString("prompt")
+	systemPromptArg, _ := cmd.Flags().GetString("system")
 	systemPrompt := resolvePrompt(systemPromptArg)
+	userPromptPrefixArg, _ := cmd.Flags().GetString("prompt")
+	userPromptPrefix := resolvePrompt(userPromptPrefixArg)
 	debug, _ := cmd.Flags().GetBool("debug")
 	maxTokens, _ := cmd.Flags().GetInt("max_tokens")
 	jsonMode, _ := cmd.Flags().GetBool("json")
@@ -1528,7 +1530,17 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	cwd, _ := os.Getwd()
 
 	// Construct initial user message to parse for @ tokens
-	var usermsg string = resolvePrompt(strings.Join(args, " "))
+	initialMsg := resolvePrompt(strings.Join(args, " "))
+	var usermsg string
+	if userPromptPrefix != "" {
+		if initialMsg != "" {
+			usermsg = userPromptPrefix + "\n" + initialMsg
+		} else {
+			usermsg = userPromptPrefix
+		}
+	} else {
+		usermsg = initialMsg
+	}
 
 	resolver := NewPathResolver(verbose)
 	cleanedPrompt, atPaths := resolver.ParsePrompt(usermsg)

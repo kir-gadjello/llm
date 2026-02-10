@@ -750,6 +750,8 @@ func main() {
 	rootCmd.Flags().BoolP("verbose", "v", false, "http & debug logging")
 	rootCmd.Flags().BoolP("dry", "d", false, "Dry run: print token stats and parameters without making network requests")
 	rootCmd.Flags().Bool("vt", false, "Lean timing debug: output response performance metrics (TTFT, TPS, etc.)")
+	rootCmd.Flags().Bool("with-thinking", false, "Output thinking/reasoning tokens")
+	rootCmd.Flags().Bool("wt", false, "Alias for --with-thinking")
 
 	// Shell Assistant
 	rootCmd.Flags().BoolP("shell", "s", false, "Shell Assistant: generate and execute shell commands")
@@ -2010,10 +2012,15 @@ func runLLMChat(cmd *cobra.Command, args []string) error {
 	firstChunk := true
 
 	// Reasoning UI state
-	logReasoning := true
-	if cfg.LogReasoning != nil {
+	withThinking, _ := cmd.Flags().GetBool("with-thinking")
+	wt, _ := cmd.Flags().GetBool("wt")
+	logReasoning := false
+	if withThinking || wt {
+		logReasoning = true
+	} else if cfg.LogReasoning != nil {
 		logReasoning = *cfg.LogReasoning
 	}
+
 	shorten := -1
 	if cfg.LogReasoningShorten != nil {
 		shorten = *cfg.LogReasoningShorten

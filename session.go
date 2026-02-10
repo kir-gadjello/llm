@@ -529,9 +529,43 @@ func runInlineLLM(cmd *cobra.Command, cfg *ConfigFile, query string, historyStr 
 		return
 	}
 
+	// Determine reasoning configuration
+	withThinking, _ := cmd.Flags().GetBool("with-thinking")
+	wt, _ := cmd.Flags().GetBool("wt")
+	logReasoning := false
+	if withThinking || wt {
+		logReasoning = true
+	} else if cfg.LogReasoning != nil {
+		logReasoning = *cfg.LogReasoning
+	}
+
+	thinkingStart := "\033[32m<thinking>\033[0m\r\n"
+	thinkingEnd := "\r\n\033[32m</thinking>\033[0m\r\n"
+	thinkingPrinted := false
+	reasoningDone := false
+	hasReasoning := false
+
 	// 6. Stream output with \r\n fix for Raw Mode
 	for event := range ch {
-		if event.Type == "content" {
+		if event.Type == "reasoning" {
+			hasReasoning = true
+			if logReasoning {
+				if !thinkingPrinted {
+					fmt.Print(thinkingStart)
+					thinkingPrinted = true
+				}
+				chunk := strings.ReplaceAll(event.Content, "\n", "\r\n")
+				fmt.Print(chunk)
+			}
+		} else if event.Type == "content" {
+			// Handle transition from reasoning to content
+			if hasReasoning && !reasoningDone {
+				if logReasoning && thinkingPrinted {
+					fmt.Print(thinkingEnd)
+				}
+				reasoningDone = true
+			}
+
 			// Raw mode requires \r\n for newlines, otherwise cursor just drops down without moving left
 			chunk := strings.ReplaceAll(event.Content, "\n", "\r\n")
 			fmt.Print(chunk)

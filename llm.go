@@ -255,7 +255,7 @@ func loadConfig() (*ConfigFile, error) {
 	}
 
 	var cfg ConfigFile
-	err = yaml.Unmarshal(data, &cfg)
+	err = yaml.Unmarshal([]byte(os.ExpandEnv(string(data))), &cfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse config file %s: %w", configPath, err)
 	}
@@ -504,10 +504,10 @@ func getRunConfig(cmd *cobra.Command, cfg *ConfigFile, modelname string) (RunCon
 			if resolvedCfg.Model != nil {
 				modelname = *resolvedCfg.Model
 			}
-			if resolvedCfg.ApiKey != nil && !cmd.Flags().Changed("api-key") && os.Getenv("OPENAI_API_KEY") == "" {
+			if resolvedCfg.ApiKey != nil && !cmd.Flags().Changed("api-key") {
 				apiKey = *resolvedCfg.ApiKey
 			}
-			if resolvedCfg.ApiBase != nil && !cmd.Flags().Changed("api-base") && os.Getenv("OPENAI_API_BASE") == "" {
+			if resolvedCfg.ApiBase != nil && !cmd.Flags().Changed("api-base") {
 				apiBase = *resolvedCfg.ApiBase
 			}
 			if resolvedCfg.Temperature != nil && !cmd.Flags().Changed("temperature") {

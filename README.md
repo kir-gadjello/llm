@@ -335,6 +335,16 @@ Use with `-m <profile>`. CLI flags override config values.
 - `extra_body` maps are deep-merged
 - Create aliases for full model names (like `x-ai/grok-4.1-fast`)
 
+**Environment Variable Expansion:**
+You can use `$VAR` or `${VAR}` syntax in your configuration values (like `api_key` or `api_base`). These will be expanded using your shell's environment variables when the config is loaded.
+
+```yaml
+models:
+  my-model:
+    api_key: ${MY_CUSTOM_API_KEY}
+    api_base: $MY_CUSTOM_ENDPOINT
+```
+
 **Profile parameters:**
 - `model`: actual model name sent to API
 - `api_base`, `api_key`: endpoint configuration
